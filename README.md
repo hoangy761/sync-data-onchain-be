@@ -28,6 +28,8 @@ npm run start:dev
 - Swagger: `http://localhost:3000/docs`
 - Health: `http://localhost:3000/health`
 
+
+
 ## Bootstrap behavior
 
 1. If `chains` is empty → seed **HyperEVM** from `CHAIN_ID`, `CHAIN_NAME`, `HYPEREVM_RPC_URL`.
@@ -38,16 +40,20 @@ npm run start:dev
 
 ## Main endpoints
 
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/health` | Liveness |
-| GET | `/api/v1/chains` | List chains |
-| GET | `/api/v1/chains/:chainId` | Chain detail |
-| GET | `/api/v1/tokens` | List tokens |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress` | Token metadata |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/balance` | Balance at head − `SYNC_CONFIRMATION_DEPTH` |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/history` | Balance history |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress/sync-status` | Sync progress |
+
+| Method | Path                                                            | Description                                 |
+| ------ | --------------------------------------------------------------- | ------------------------------------------- |
+| GET    | `/health`                                                       | Liveness                                    |
+| GET    | `/api/v1/chains`                                                | List chains                                 |
+| GET    | `/api/v1/chains/:chainId`                                       | Chain detail                                |
+| GET    | `/api/v1/tokens`                                                | List tokens                                 |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress`                         | Token metadata                              |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/balance` | Balance at head − `SYNC_CONFIRMATION_DEPTH` |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/history` | Balance history                             |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/sync-status`             | Sync progress                               |
+
+
+
 
 ## Notes
 
@@ -58,3 +64,35 @@ npm run start:dev
 - HyperEVM `balanceOf` is only reliable at the current head (any other block returns 0). A missing holder balance is `balance(head) - net Transfer delta after the checkpoint`. That log scan is cached and resumed (max 1000 blocks per `eth_getLogs`).
 - Admin APIs to add chain/token and custom sync start time are intentionally out of MVP scope.
 - Prefer smaller `SYNC_BLOCK_RANGE` (e.g. 100) if the RPC returns rate-limit / CU errors.
+
+
+
+### Deploy to a VM via Docker Hub
+
+**1. Build and push (local machine):**
+
+```bash
+docker build --platform linux/amd64 --target production -t hoangy761/sync-data-onchain-be:latest .
+docker push hoangy761/sync-data-onchain-be:latest
+```
+
+**2. On the VM:** copy `docker-compose.yml`, create `.env` from `[.env.example](.env.example)`.
+
+**3. Run:**
+
+```bash
+docker compose pull && docker compose up -d && docker compose logs -f
+```
+
+Port **3333** is published to the host. Restrict access with firewall (allow only your IP or VPN). For public HTTPS, put nginx/Caddy in front.
+
+**Update:**
+
+```bash
+docker compose pull && docker compose up -d && docker compose logs -f
+```
+
+```
+
+```
+

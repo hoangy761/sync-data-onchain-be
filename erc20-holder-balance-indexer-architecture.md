@@ -1,19 +1,19 @@
 # ERC-20 Holder Balance Indexer
 
-## 1. Tổng quan
+## 1. Overview
 
-### Mục tiêu
+### Goal
 
-Xây dựng service đồng bộ holder balance ERC-20 (ví dụ USDC) từ blockchain vào PostgreSQL, kèm Swagger API để truy vấn:
+Build a service that syncs ERC-20 holder balances (for example USDC) from the blockchain into PostgreSQL, with a Swagger API to query:
 
-- Balance hiện tại của một địa chỉ.
-- Lịch sử thay đổi balance theo từng `Transfer` event.
-- Thông tin transaction, block và mức tăng/giảm balance.
-- Tiến độ đồng bộ của từng token.
+- The current balance of an address.
+- Balance-change history for each `Transfer` event.
+- Transaction and block details, plus the balance increase or decrease.
+- Sync progress for each token.
 
-**Nguyên tắc:** ship MVP trong ~3 ngày, nhưng thiết kế seam từ đầu để scale sau (thêm token/chain, tách worker, tăng throughput) mà không phải viết lại schema hoặc luồng sync cốt lõi.
+**Principle:** ship an MVP in about 3 days, but design the seams up front so the system can scale later (more tokens/chains, a separate worker, higher throughput) without rewriting the schema or the core sync flow.
 
-### Công nghệ (chốt)
+### Technology (locked in)
 
 - **Backend:** NestJS + TypeScript
 - **Database:** PostgreSQL
@@ -21,75 +21,75 @@ Xây dựng service đồng bộ holder balance ERC-20 (ví dụ USDC) từ bloc
 - **API docs:** Swagger / OpenAPI (`@nestjs/swagger`)
 - **Blockchain:** `viem` + EVM JSON-RPC
 
-### Phạm vi theo giai đoạn
+### Scope by phase
 
-| | Trong 3 ngày (MVP) | Scale sau (giữ seam sẵn) |
+| | Within 3 days (MVP) | Later scale (seams already in place) |
 | --- | --- | --- |
-| Chain / token | 1 chain + 1 token (seed qua env) | Nhiều token / nhiều chain qua bảng `tokens` |
-| Process | API + worker chung 1 NestJS process | Tách worker process / queue, cùng DB schema |
-| Reorg | Chỉ sync tới `head - confirmationDepth` | Rollback/replay theo `block_hash` |
-| Raw events | Không bắt buộc | Thêm `transfer_events` khi cần audit/replay |
-| Pagination | `limit` + cursor đơn giản | Keyset ổn định khi history lớn |
-| Partition | Không | Partition history theo block/time khi đủ lớn |
+| Chain / token | 1 chain + 1 token (seeded via env) | Many tokens / many chains via the `tokens` table |
+| Process | API + worker in one NestJS process | Separate worker process / queue, same DB schema |
+| Reorg | Sync only up to `head - confirmationDepth` | Rollback/replay by `block_hash` |
+| Raw events | Not required | Add `transfer_events` when audit/replay is needed |
+| Pagination | `limit` + a simple cursor | Stable keyset pagination when history is large |
+| Partition | None | Partition history by block/time when it is large enough |
 
-> Lưu ý: Không phải token ERC-20 nào cũng suy ra balance đúng chỉ từ Transfer. Token rebasing / balance đặc biệt cần reconciliation riêng (Phase 2+).
-
----
-
-## 1.1. Nguyên tắc scale-ready (làm ngay từ MVP)
-
-Làm đúng các điểm này ngay từ đầu; **không** cần build hết Phase 2/3 trong 3 ngày:
-
-1. **Schema đa chiều:** mọi bảng chính khóa theo `(chain_id, token_address, ...)`. MVP chỉ seed 1 token nhưng schema đã sẵn multi-token/multi-chain.
-2. **Tách module rõ:** `blockchain` (RPC) / `sync` (indexer) / `balances` (read API) / `tokens` (metadata). Sau này tách worker = bật module `sync` ở process khác, không đụng API.
-3. **Idempotent write path:** unique key theo event + apply balance đúng 1 lần trong DB transaction. Đây là nền để retry / multi-worker an toàn sau này.
-4. **Checkpoint per token:** `sync_checkpoints` theo `(chain_id, token_address)` — scale ngang theo token mà không đụng checkpoint chung.
-5. **NUMERIC + string API:** tránh rewrite precision khi volume tăng.
-6. **Config qua env:** RPC, batch size, confirmation depth, poll interval — tune throughput không đổi code.
-7. **API chỉ đọc DB:** không gọi RPC trên hot path; sau này thêm cache/read replica không phá contract.
-8. **Feature flag process:** `SYNC_ENABLED=true|false` để cùng codebase chạy API-only hoặc worker-only.
-
-**Cố tình chưa làm trong MVP (tránh over-engineer):** queue (Bull/Kafka), distributed lock, partition, multi-RPC failover phức tạp, metrics stack đầy đủ, Top holders nếu đề không bắt buộc.
+> Note: not every ERC-20 token yields a correct balance from `Transfer` events alone. Rebasing tokens and tokens with special balance rules need their own reconciliation (Phase 2+).
 
 ---
 
-## 2. Đề bài
+## 1.1. Scale-ready principles (apply from the MVP)
 
-Cho một ERC-20 token, ví dụ USDC, cần xây dựng hệ thống theo dõi balance của từng holder.
+Get these right from the start; **do not** build all of Phase 2/3 in the 3 days:
 
-Hệ thống phải giải quyết các yêu cầu:
+1. **Multi-dimensional schema:** every main table is keyed by `(chain_id, token_address, ...)`. The MVP seeds one token, but the schema is already multi-token / multi-chain.
+2. **Clear module boundaries:** `blockchain` (RPC) / `sync` (indexer) / `balances` (read API) / `tokens` (metadata). Splitting the worker later means enabling the `sync` module in another process, without touching the API.
+3. **Idempotent write path:** a unique key per event, and apply the balance exactly once inside a DB transaction. This is the foundation for safe retries and multi-worker writes later.
+4. **Checkpoint per token:** `sync_checkpoints` keyed by `(chain_id, token_address)` — scale horizontally by token without a shared checkpoint.
+5. **NUMERIC + string API:** avoid a precision rewrite when volume grows.
+6. **Config via env:** RPC, batch size, confirmation depth, poll interval — tune throughput without changing code.
+7. **API reads the DB only:** do not call RPC on the hot path; adding a cache or read replica later does not break the contract.
+8. **Process feature flag:** `SYNC_ENABLED=true|false` so the same codebase can run API-only or worker-only.
 
-1. Đọc các `Transfer` event từ blockchain theo block range.
-2. Xác định thay đổi balance của địa chỉ gửi và địa chỉ nhận.
-3. Lưu balance hiện tại để API có thể truy vấn nhanh.
-4. Lưu lịch sử để xem balance đã thay đổi như thế nào theo thời gian.
-5. Không ghi trùng event khi worker retry.
-6. Không cập nhật balance hai lần nếu một batch được xử lý lại.
-7. Lưu checkpoint để tiếp tục sync sau khi service restart.
-8. Có chiến lược xử lý RPC timeout / rate limit; reorg tối thiểu bằng `confirmationDepth` (rollback đầy đủ để Phase 2).
-9. Cung cấp Swagger API để kiểm thử và tích hợp.
-10. Đảm bảo giá trị token chính xác, không dùng floating point cho số dư on-chain.
+**Intentionally out of the MVP (avoid over-engineering):** a queue (Bull/Kafka), a distributed lock, partitioning, complex multi-RPC failover, a full metrics stack, and top holders unless the brief requires them.
 
-### Các truy vấn chính
+---
+
+## 2. Problem statement
+
+Given an ERC-20 token, for example USDC, build a system that tracks the balance of each holder.
+
+The system must meet these requirements:
+
+1. Read `Transfer` events from the blockchain by block range.
+2. Determine the balance change for the sender and the receiver.
+3. Store the current balance so the API can query it quickly.
+4. Store history so balance changes can be inspected over time.
+5. Do not write the same event twice when the worker retries.
+6. Do not update a balance twice if a batch is processed again.
+7. Store a checkpoint so sync can resume after a service restart.
+8. Have a strategy for RPC timeout / rate limit; handle reorgs minimally via `confirmationDepth` (full rollback is Phase 2).
+9. Provide a Swagger API for testing and integration.
+10. Keep token amounts exact; do not use floating point for on-chain balances.
+
+### Primary queries
 
 **MVP**
 
-- Lấy balance hiện tại của một holder.
-- Lấy lịch sử balance của holder theo thứ tự thời gian (có `limit` / cursor).
-- Lấy tiến độ sync của token.
-- Lấy metadata token đang theo dõi.
+- Get the current balance of a holder.
+- Get a holder's balance history in time order (`limit` / cursor).
+- Get the token's sync progress.
+- Get metadata for the token being tracked.
 
-**Scale sau / optional**
+**Later scale / optional**
 
-- Lọc lịch sử theo khoảng block hoặc thời gian.
-- Top holders (`ORDER BY balance DESC` + index phụ khi cần).
-- Admin: thêm token / trigger resync qua API.
+- Filter history by block range or time range.
+- Top holders (`ORDER BY balance DESC` plus a secondary index when needed).
+- Admin: add a token / trigger a resync via the API.
 
 ---
 
-## 3. Kiến trúc hệ thống
+## 3. System architecture
 
-### 3.0. MVP (1 process) vs Scale (tách process)
+### 3.0. MVP (1 process) vs scale (split processes)
 
 ```mermaid
 flowchart LR
@@ -117,9 +117,9 @@ flowchart LR
   API2 --> DB
 ```
 
-Cùng schema + cùng module boundary → scale bằng cách tách deploy / bật `SYNC_ENABLED`, không redesign.
+Same schema + same module boundaries → scale by splitting deploys / toggling `SYNC_ENABLED`, without a redesign.
 
-### 3.1. Luồng dữ liệu
+### 3.1. Data flow
 
 ```mermaid
 flowchart TD
@@ -151,62 +151,62 @@ flowchart TD
     API --> CHECK
 ```
 
-### Các thành phần
+### Components
 
 #### 3.2. Blockchain RPC
 
-- Đọc block và `Transfer` logs theo block range.
-- Lấy timestamp và block hash cho các event.
-- Giới hạn block range theo giới hạn của provider (`SYNC_BLOCK_RANGE`).
-- Retry có exponential backoff khi gặp lỗi tạm thời (timeout, 429).
-- **Scale sau:** thêm RPC fallback list / provider pool mà không đổi contract của `TransferLogReader`.
+- Read blocks and `Transfer` logs by block range.
+- Fetch the timestamp and block hash for each event.
+- Cap the block range to the provider limit (`SYNC_BLOCK_RANGE`).
+- Retry with exponential backoff on transient errors (timeout, 429).
+- **Later scale:** add an RPC fallback list / provider pool without changing the `TransferLogReader` contract.
 
-#### 3.3. Sync Worker / Indexer
+#### 3.3. Sync worker / indexer
 
-Worker có nhiệm vụ:
+The worker:
 
-1. Đọc checkpoint hiện tại (theo token).
-2. Xác định block range tiếp theo; safe head = `latest - confirmationDepth`.
-3. Lấy log từ RPC.
-4. Sắp xếp log theo `blockNumber`, `transactionIndex`, `logIndex`.
-5. Decode và chuẩn hóa địa chỉ (lowercase).
-6. Tính delta cho từng holder.
-7. Ghi history, cập nhật current balance và checkpoint trong **một** DB transaction.
-8. Chỉ đánh dấu range hoàn tất sau khi commit thành công.
+1. Reads the current checkpoint (per token).
+2. Determines the next block range; safe head = `latest - confirmationDepth`.
+3. Fetches logs from RPC.
+4. Sorts logs by `blockNumber`, `transactionIndex`, `logIndex`.
+5. Decodes events and normalizes addresses (lowercase).
+6. Computes the delta for each holder.
+7. Writes history, updates the current balance, and updates the checkpoint in **one** DB transaction.
+8. Marks the range complete only after a successful commit.
 
-MVP: một worker loop tuần tự cho các token `enabled`. Không chạy song song cùng token nếu chưa có lock.
+MVP: one sequential worker loop over `enabled` tokens. Do not process the same token in parallel until a lock exists.
 
-**Scale sau:** một worker process per token / per chain; hoặc queue job theo `(chainId, tokenAddress, fromBlock, toBlock)`.
+**Later scale:** one worker process per token / per chain; or a queue job keyed by `(chainId, tokenAddress, fromBlock, toBlock)`.
 
 #### 3.4. PostgreSQL
 
 - `tokens`: metadata + `deployment_block` / start block.
-- `token_balances`: số dư hiện tại.
-- `token_balance_history`: lịch sử theo event.
-- `sync_checkpoints`: tiến độ sync.
-- `transfer_events` (Phase 2): raw log cho replay / audit / reorg.
+- `token_balances`: current balances.
+- `token_balance_history`: per-event history.
+- `sync_checkpoints`: sync progress.
+- `transfer_events` (Phase 2): raw logs for replay / audit / reorg.
 
 #### 3.5. NestJS API
 
-API chỉ phục vụ truy vấn dữ liệu đã đồng bộ; không gọi RPC cho request đọc balance thông thường.
+The API only serves already-synced data; it does not call RPC for ordinary balance reads.
 
-Swagger qua `@nestjs/swagger` tại `/docs`.
+Swagger is served via `@nestjs/swagger` at `/docs`.
 
 ---
 
-## 4. Thiết kế database
+## 4. Database design
 
-### 4.1. Nguyên tắc
+### 4.1. Principles
 
-- Mỗi token: `chain_id + token_address`.
-- Mỗi holder: `chain_id + token_address + holder_address`.
-- Chuẩn hóa địa chỉ về lowercase nếu dùng `VARCHAR`.
-- Balance lưu raw integer unit; không chia `10 ** decimals` trong DB.
-- Dùng `NUMERIC`, không dùng `FLOAT` / `REAL`.
-- API trả raw amount dạng string.
-- `decimals` / `symbol` nằm ở bảng `tokens`.
+- Each token: `chain_id + token_address`.
+- Each holder: `chain_id + token_address + holder_address`.
+- Normalize addresses to lowercase when using `VARCHAR`.
+- Store balances as raw integer units; do not divide by `10 ** decimals` in the DB.
+- Use `NUMERIC`, not `FLOAT` / `REAL`.
+- The API returns raw amounts as strings.
+- `decimals` / `symbol` live on the `tokens` table.
 
-### 4.2. Bảng `tokens`
+### 4.2. Table `tokens`
 
 ```sql
 CREATE TABLE tokens (
@@ -224,9 +224,9 @@ CREATE TABLE tokens (
 );
 ```
 
-MVP: seed 1 row từ env lúc bootstrap. Scale: thêm token bằng insert / admin API sau.
+MVP: seed one row from env at bootstrap. Scale: add tokens via insert / an admin API later.
 
-### 4.3. Bảng `token_balances`
+### 4.3. Table `token_balances`
 
 ```sql
 CREATE TABLE token_balances (
@@ -243,20 +243,20 @@ CREATE TABLE token_balances (
 );
 ```
 
-Ghi chú:
+Notes:
 
-- Lookup balance theo PK là đủ cho MVP.
-- Có thể xóa row khi balance = 0; API hiểu thiếu row = 0. Nếu cần “mọi holder từng xuất hiện”, giữ row balance 0.
-- **Scale — Top holders:** thêm index khi thật sự cần:
+- A PK lookup is enough for current-balance reads in the MVP.
+- A row may be deleted when the balance is 0; the API treats a missing row as 0. If "every holder that ever appeared" is required, keep the zero-balance row.
+- **Scale — top holders:** add this index only when it is actually needed:
 
 ```sql
 CREATE INDEX idx_token_balances_top
 ON token_balances (chain_id, token_address, balance DESC);
 ```
 
-### 4.4. Bảng `token_balance_history`
+### 4.4. Table `token_balance_history`
 
-Một Transfer thường tạo tối đa 2 row (sender + receiver). Mint/burn với zero address có quy tắc riêng.
+One `Transfer` usually creates at most two rows (sender + receiver). Mint/burn against the zero address has its own rules.
 
 ```sql
 CREATE TABLE token_balance_history (
@@ -293,7 +293,7 @@ ON token_balance_history (
     log_index DESC
 );
 
--- Optional khi cần query/reorg theo block
+-- Optional when querying or handling reorgs by block
 CREATE INDEX idx_balance_history_block
 ON token_balance_history (
     chain_id,
@@ -302,9 +302,9 @@ ON token_balance_history (
 );
 ```
 
-`delta` dùng `NUMERIC(80,0)` để an toàn hơn với hiệu có dấu gần giới hạn `uint256`.
+`delta` uses `NUMERIC(80,0)` so a signed difference near the `uint256` limit stays safe.
 
-### 4.5. Bảng `sync_checkpoints`
+### 4.5. Table `sync_checkpoints`
 
 ```sql
 CREATE TABLE sync_checkpoints (
@@ -318,11 +318,11 @@ CREATE TABLE sync_checkpoints (
 );
 ```
 
-Không cập nhật checkpoint trước khi balance/history commit thành công.
+Do not advance the checkpoint before the balance and history commit succeeds.
 
-### 4.6. Bảng `transfer_events` (Phase 2 — optional)
+### 4.6. Table `transfer_events` (Phase 2 — optional)
 
-Bật khi cần replay, audit, hoặc reorg dễ hơn. **Không bắt buộc MVP.**
+Enable this when replay, audit, or easier reorg handling is needed. **Not required for the MVP.**
 
 ```sql
 CREATE TABLE transfer_events (
@@ -347,46 +347,46 @@ ON transfer_events (chain_id, token_address, block_number);
 
 ---
 
-## 5. Luồng xử lý Transfer event
+## 5. Transfer event processing
 
-Ví dụ `Transfer(A, B, 100)` với A=500, B=200 trước event:
+Example: `Transfer(A, B, 100)` where A=500 and B=200 before the event:
 
 - A: before=500, delta=-100, after=400
 - B: before=200, delta=+100, after=300
 
-### Quy trình một block range
+### Processing one block range
 
-1. Lấy logs trong `[from, to]`, với `to <= latest - confirmationDepth`.
-2. Sort theo `block_number`, `transaction_index`, `log_index`.
-3. Decode event.
-4. Xác định sender / receiver (mint/burn/self-transfer).
-5. Đọc balance hiện tại của holder bị tác động (trong transaction, có thể `SELECT ... FOR UPDATE` khi scale multi-writer).
-6. Tính `balance_before`, `delta`, `balance_after`.
-7. Insert history (ON CONFLICT DO NOTHING / fail-and-skip nếu đã có — quy tắc idempotent rõ ràng).
-8. Update current balance **chỉ khi** history mới được ghi.
-9. Update checkpoint + `last_block_hash`.
+1. Fetch logs in `[from, to]`, with `to <= latest - confirmationDepth`.
+2. Sort by `block_number`, `transaction_index`, `log_index`.
+3. Decode the event.
+4. Identify sender / receiver (mint / burn / self-transfer).
+5. Read the current balance of each affected holder (inside the transaction; `SELECT ... FOR UPDATE` when scaling to multiple writers).
+6. Compute `balance_before`, `delta`, `balance_after`.
+7. Insert history (`ON CONFLICT DO NOTHING` / fail-and-skip if the row already exists — keep the idempotency rule explicit).
+8. Update the current balance **only when** the history row is newly written.
+9. Update the checkpoint and `last_block_hash`.
 10. Commit.
 
-### Chống duplicate và retry
+### Duplicate protection and retries
 
-Unique trên history **chưa đủ** nếu vẫn cộng balance khi conflict. Chọn một quy tắc và giữ xuyên suốt:
+A unique constraint on history **is not enough** if a conflict still increments the balance. Pick one rule and keep it everywhere:
 
-- Insert history trước; chỉ apply balance khi insert thành công (row mới).
-- Hoặc ghi raw event unique trước (Phase 2), rồi apply balance theo event mới.
+- Insert history first; apply the balance only when the insert succeeds (a new row).
+- Or write a unique raw event first (Phase 2), then apply the balance only for new events.
 
-Batch lỗi → rollback toàn bộ → retry. Không commit checkpoint sớm.
+A failed batch → roll back the whole transaction → retry. Do not commit the checkpoint early.
 
 ### Edge cases
 
-- Mint: `from` = zero address.
-- Burn: `to` = zero address.
-- Self-transfer: delta ròng = 0; tránh double-apply sai.
-- Nhiều Transfer cùng holder trong 1 block: giữ thứ tự log; history event-level.
-- Reorg (MVP): tránh bằng `confirmationDepth`. Phase 2: so `block_hash`, rollback từ block lệch rồi replay.
+- Mint: `from` is the zero address.
+- Burn: `to` is the zero address.
+- Self-transfer: net delta is 0; avoid a bad double-apply.
+- Several transfers for the same holder in one block: preserve log order; history stays event-level.
+- Reorg (MVP): avoid it with `confirmationDepth`. Phase 2: compare `block_hash`, roll back from the diverging block, then replay.
 
 ---
 
-## 6. Tối ưu read/write
+## 6. Read/write optimization
 
 ### Read: current balance
 
@@ -398,7 +398,7 @@ WHERE chain_id = $1
   AND holder_address = LOWER($3);
 ```
 
-### Read: lịch sử
+### Read: history
 
 ```sql
 SELECT
@@ -417,22 +417,22 @@ ORDER BY block_number DESC, transaction_index DESC, log_index DESC
 LIMIT $4;
 ```
 
-MVP: cursor đơn giản dựa trên `(block_number, transaction_index, log_index)`. Scale: keyset pagination, tránh `OFFSET` cao.
+MVP: a simple cursor based on `(block_number, transaction_index, log_index)`. Scale: keyset pagination; avoid a large `OFFSET`.
 
 ### Write
 
-- Batch vài trăm–vài nghìn log; tune bằng `SYNC_BLOCK_RANGE`.
-- Bulk insert history.
-- Aggregate delta cho current balance trong batch **sau khi** đã tạo history đúng thứ tự.
-- MVP: 1 worker tuần tự. Scale: giới hạn concurrency theo token + row lock.
+- Batch a few hundred to a few thousand logs; tune with `SYNC_BLOCK_RANGE`.
+- Bulk-insert history.
+- Aggregate deltas for the current balance in the batch **after** history has been written in the correct order.
+- MVP: one sequential worker. Scale: limit concurrency per token and use row locks.
 
 ### Partitioning
 
-Chưa cần lúc đầu. Khi history rất lớn, partition theo block/time; thiết kế unique constraint tương thích partition key.
+Not needed at the start. When history is very large, partition by block or time; design the unique constraint so it is compatible with the partition key.
 
 ---
 
-## 7. Cấu trúc dự án NestJS
+## 7. NestJS project structure
 
 ```text
 src/
@@ -478,22 +478,22 @@ src/
     └── utils/
 ```
 
-### Trách nhiệm module
+### Module responsibilities
 
 | Module | MVP | Scale path |
 | --- | --- | --- |
 | `blockchain` | 1 RPC client | Provider pool / failover |
-| `sync` | Loop trong cùng process (`SYNC_ENABLED`) | Process riêng / queue jobs |
-| `tokens` | Seed 1 token từ env | CRUD nhiều token |
+| `sync` | Loop in the same process (`SYNC_ENABLED`) | Separate process / queue jobs |
+| `tokens` | Seed 1 token from env | CRUD for many tokens |
 | `balances` | Read API | Cache / read replica |
-| `database` | Migrations | Partition / connection pool tune |
+| `database` | Migrations | Partition / connection-pool tuning |
 
-Không bật `synchronize: true` ở môi trường thật.
+Do not enable `synchronize: true` in a real environment.
 
-### Bootstrap gợi ý
+### Suggested bootstrap
 
-- `SYNC_ENABLED=true`: start worker sau khi app listen.
-- `SYNC_ENABLED=false`: API-only (chuẩn bị scale horizontal cho read).
+- `SYNC_ENABLED=true`: start the worker after the app is listening.
+- `SYNC_ENABLED=false`: API-only (ready to scale reads horizontally).
 
 ---
 
@@ -501,19 +501,19 @@ Không bật `synchronize: true` ở môi trường thật.
 
 Base path: `/api/v1`
 
-| Method | Endpoint | MVP | Ghi chú |
+| Method | Endpoint | MVP | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/health` | Có | Liveness |
-| `GET` | `/tokens` | Có | Danh sách token |
-| `GET` | `/tokens/:chainId/:tokenAddress` | Có | Metadata |
-| `GET` | `/tokens/:chainId/:tokenAddress/holders/:holderAddress/balance` | Có | Balance hiện tại |
-| `GET` | `/tokens/:chainId/:tokenAddress/holders/:holderAddress/history` | Có | Lịch sử + cursor |
-| `GET` | `/tokens/:chainId/:tokenAddress/sync-status` | Có | Checkpoint / lag |
-| `GET` | `/tokens/:chainId/:tokenAddress/holders/top` | Optional | Scale / nếu đề yêu cầu |
-| `POST` | `/tokens` | Optional | Admin thêm token |
-| `POST` | `/tokens/:chainId/:tokenAddress/sync` | Optional | Admin resync |
+| `GET` | `/health` | Yes | Liveness |
+| `GET` | `/tokens` | Yes | Token list |
+| `GET` | `/tokens/:chainId/:tokenAddress` | Yes | Metadata |
+| `GET` | `/tokens/:chainId/:tokenAddress/holders/:holderAddress/balance` | Yes | Current balance |
+| `GET` | `/tokens/:chainId/:tokenAddress/holders/:holderAddress/history` | Yes | History + cursor |
+| `GET` | `/tokens/:chainId/:tokenAddress/sync-status` | Yes | Checkpoint / lag |
+| `GET` | `/tokens/:chainId/:tokenAddress/holders/top` | Optional | Scale / if the brief requires it |
+| `POST` | `/tokens` | Optional | Admin: add a token |
+| `POST` | `/tokens/:chainId/:tokenAddress/sync` | Optional | Admin: resync |
 
-### Ví dụ: current balance
+### Example: current balance
 
 ```json
 {
@@ -527,9 +527,9 @@ Base path: `/api/v1`
 }
 ```
 
-`balanceRaw` / block number trả string. `balanceFormatted` dùng decimal-safe formatter.
+`balanceRaw` and block numbers are returned as strings. `balanceFormatted` uses a decimal-safe formatter.
 
-### Ví dụ: history
+### Example: history
 
 ```json
 {
@@ -580,34 +580,34 @@ bootstrap();
 
 ---
 
-## 9. Bảo đảm tính chính xác
+## 9. Correctness guarantees
 
-### Thứ tự event
+### Event order
 
-Sort theo `block_number` → `transaction_index` → `log_index`.
+Sort by `block_number` → `transaction_index` → `log_index`.
 
-### Sync an toàn
+### Safe sync
 
-- **MVP:** chỉ index tới `head - SYNC_CONFIRMATION_DEPTH`; lưu `last_block_hash`.
-- **Phase 2:** nếu hash tại checkpoint không còn canonical → rollback từ block lệch → replay.
-- Ghi balance + history + checkpoint trong cùng transaction.
+- **MVP:** index only up to `head - SYNC_CONFIRMATION_DEPTH`; store `last_block_hash`.
+- **Phase 2:** if the hash at the checkpoint is no longer canonical → roll back from the diverging block → replay.
+- Write balance, history, and checkpoint in the same transaction.
 
-### Đối soát (Phase 2)
+### Reconciliation (Phase 2)
 
-Định kỳ so sánh một số holder với `balanceOf(holder)` tại block đã confirmed. Danh sách holder lấy từ event/DB, không từ `balanceOf`.
+Periodically compare a sample of holders against `balanceOf(holder)` at a confirmed block. The holder list comes from events/the DB, not from `balanceOf`.
 
 ---
 
-## 10. Cấu hình môi trường
+## 10. Environment configuration
 
-Thiết kế env để MVP chạy được ngay và scale bằng cách thêm biến / tách process, không đổi schema.
+Design env so the MVP runs immediately and scale happens by adding variables or splitting processes, without a schema change.
 
 ```dotenv
 # App
 NODE_ENV=development
 PORT=3000
 
-# Process role — scale: API replica đặt SYNC_ENABLED=false
+# Process role — scale: API replicas set SYNC_ENABLED=false
 SYNC_ENABLED=true
 
 # PostgreSQL
@@ -619,19 +619,19 @@ DATABASE_NAME=indexer
 
 # RPC (viem)
 RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
-# Scale sau (optional):
+# Later scale (optional):
 # RPC_URL_FALLBACK=https://...
 
-# Seed token MVP (1 token). Scale: thêm row vào bảng tokens
+# MVP token seed (1 token). Scale: insert more rows into the tokens table
 CHAIN_ID=1
 TOKEN_ADDRESS=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48
 TOKEN_SYMBOL=USDC
 TOKEN_NAME=USD Coin
 TOKEN_DECIMALS=6
-# Dùng block gần đây để demo kịp; production: deployment/start block đã xác minh
+# Use a recent block for a timely demo; production: a verified deployment/start block
 SYNC_START_BLOCK=22000000
 
-# Sync tuning — tăng/giảm để scale throughput
+# Sync tuning — raise or lower to scale throughput
 SYNC_BLOCK_RANGE=500
 SYNC_CONFIRMATION_DEPTH=12
 SYNC_POLL_INTERVAL_MS=5000
@@ -639,103 +639,103 @@ SYNC_RETRY_MAX_ATTEMPTS=5
 SYNC_RETRY_BASE_DELAY_MS=1000
 ```
 
-| Biến | Bắt buộc MVP | Mục đích |
+| Variable | Required for MVP | Purpose |
 | --- | --- | --- |
-| `DATABASE_*` | Có | Postgres |
-| `RPC_URL` | Có | `eth_getLogs` / block |
-| `CHAIN_ID`, `TOKEN_*`, `SYNC_START_BLOCK` | Có | Seed 1 token |
-| `SYNC_BLOCK_RANGE` | Có | Kích thước batch |
-| `SYNC_CONFIRMATION_DEPTH` | Có | Giảm reorg MVP |
-| `SYNC_POLL_INTERVAL_MS` | Có | Poll khi bắt kịp head |
-| `SYNC_ENABLED` | Nên có | Tách API / worker sau này |
-| `SYNC_RETRY_*` | Nên có | Backoff RPC |
-| `RPC_URL_FALLBACK` | Không | Scale reliability |
+| `DATABASE_*` | Yes | Postgres |
+| `RPC_URL` | Yes | `eth_getLogs` / blocks |
+| `CHAIN_ID`, `TOKEN_*`, `SYNC_START_BLOCK` | Yes | Seed 1 token |
+| `SYNC_BLOCK_RANGE` | Yes | Batch size |
+| `SYNC_CONFIRMATION_DEPTH` | Yes | Reduce MVP reorg exposure |
+| `SYNC_POLL_INTERVAL_MS` | Yes | Poll once caught up to head |
+| `SYNC_ENABLED` | Recommended | Split API / worker later |
+| `SYNC_RETRY_*` | Recommended | RPC backoff |
+| `RPC_URL_FALLBACK` | No | Scale reliability |
 
-Không commit `.env` có secret. Validate env lúc boot (`Joi` / `zod` / `class-validator`).
+Do not commit a `.env` that contains secrets. Validate env at boot (`Joi` / `zod` / `class-validator`).
 
-**Lưu ý demo 3 ngày:** đừng để `SYNC_START_BLOCK` quá xa head trên mainnet (USDC từ đầu sẽ sync rất lâu). Chọn cửa sổ vài nghìn–vài chục nghìn block, hoặc Anvil + token local.
+**3-day demo note:** do not set `SYNC_START_BLOCK` too far behind head on mainnet (USDC from genesis will take a very long time to sync). Pick a window of a few thousand to a few tens of thousands of blocks, or use Anvil plus a local token.
 
 ---
 
-## 11. Kiểm thử
+## 11. Testing
 
-### MVP (ưu tiên)
+### MVP (priority)
 
-1. Decode đúng ERC-20 Transfer.
-2. Sender trừ / receiver cộng đúng.
-3. Mint, burn, self-transfer.
-4. Nhiều event cùng holder trong 1 block.
-5. Retry cùng batch không double-apply balance.
-6. Rollback DB khi batch lỗi giữa chừng.
-7. Checkpoint chỉ tiến sau commit.
-8. API history đúng thứ tự + precision (số lớn dạng string).
+1. Decode an ERC-20 `Transfer` correctly.
+2. Subtract from the sender and add to the receiver correctly.
+3. Mint, burn, and self-transfer.
+4. Several events for the same holder in one block.
+5. Retrying the same batch does not double-apply the balance.
+6. The DB rolls back when a batch fails partway through.
+7. The checkpoint advances only after commit.
+8. The history API returns the correct order and precision (large numbers as strings).
 
 ### Phase 2+
 
-9. Reorg detect + replay.
-10. Reconciliation với `balanceOf()`.
-11. Multi-token checkpoint độc lập.
-12. API-only process với `SYNC_ENABLED=false`.
+9. Reorg detection + replay.
+10. Reconciliation against `balanceOf()`.
+11. Independent checkpoints for multiple tokens.
+12. An API-only process with `SYNC_ENABLED=false`.
 
 ---
 
-## 12. Kế hoạch 3 ngày + đường scale
+## 12. 3-day plan and the scale path
 
-### Day 1 — Nền tảng
+### Day 1 — Foundation
 
 - NestJS + TypeORM + Postgres (Docker Compose).
 - Migrations: `tokens`, `token_balances`, `token_balance_history`, `sync_checkpoints`.
 - Config/env validation + seed 1 token.
-- `blockchain`: RPC client + đọc Transfer logs theo range.
+- `blockchain`: RPC client + read `Transfer` logs by range.
 
-### Day 2 — Sync đúng
+### Day 2 — Correct sync
 
-- Worker: checkpoint → fetch → decode → apply idempotent trong transaction.
-- Xử lý mint/burn/self-transfer + retry backoff.
+- Worker: checkpoint → fetch → decode → idempotent apply inside a transaction.
+- Handle mint/burn/self-transfer + retry backoff.
 - `confirmationDepth` safe head.
-- Đơn giản: chạy sync một cửa sổ block gần đây để có data demo.
+- Keep it simple: sync a recent block window so there is demo data.
 
-### Day 3 — API + hoàn thiện
+### Day 3 — API and polish
 
 - Balance / history / sync-status / tokens + Swagger.
 - `GET /health`.
-- Test case cốt lõi + README chạy local.
-- (Optional nếu còn giờ) Top holders hoặc `transfer_events`.
+- Core test cases + a README for running locally.
+- (Optional if time remains) Top holders or `transfer_events`.
 
-### Phase 2 — Reliability (sau đề)
+### Phase 2 — Reliability (after the brief)
 
 - `transfer_events` + reorg rollback/replay.
-- Reconciliation `balanceOf`.
-- Structured logs / metrics / lag alert.
-- Worker lock theo token.
+- `balanceOf` reconciliation.
+- Structured logs / metrics / lag alerts.
+- A worker lock per token.
 
 ### Phase 3 — Scale
 
-- `SYNC_ENABLED` tách API/worker deploy.
-- Queue theo block range / per-token worker.
-- Benchmark batch size; connection pool.
-- Keyset pagination cứng; partition history khi đủ lớn.
-- Multi-RPC fallback; nhiều chain.
+- Use `SYNC_ENABLED` to split API and worker deploys.
+- A queue by block range / a per-token worker.
+- Benchmark batch size; tune the connection pool.
+- Strict keyset pagination; partition history when it is large enough.
+- Multi-RPC fallback; multiple chains.
 
 ---
 
-## 13. Quyết định kiến trúc mặc định
+## 13. Default architecture decisions
 
-| Hạng mục | MVP (3 ngày) | Scale path |
+| Item | MVP (3 days) | Scale path |
 | --- | --- | --- |
-| Backend | NestJS monolith (API + worker) | Tách process cùng codebase |
-| Database | PostgreSQL | Read replica / partition sau |
-| ORM | TypeORM + migrations | Không đổi |
+| Backend | NestJS monolith (API + worker) | Split processes, same codebase |
+| Database | PostgreSQL | Read replica / partition later |
+| ORM | TypeORM + migrations | Unchanged |
 | Chain lib | `viem` | Provider pool |
-| Current balance | `token_balances` | + index top holders nếu cần |
-| History | `token_balance_history` event-level | Partition / retention |
+| Current balance | `token_balances` | + top-holders index if needed |
+| History | Event-level `token_balance_history` | Partition / retention |
 | Sync progress | `sync_checkpoints` per token | Multi-worker per token |
-| Raw events | Bỏ qua | `transfer_events` |
+| Raw events | Skip | `transfer_events` |
 | Write | Batch + TX + idempotency | Queue + lock |
 | Read | PK lookup + holder index | Cache / replica |
-| Pagination | Limit + cursor đơn giản | Keyset |
-| Precision | `NUMERIC` + string API | Không đổi |
+| Pagination | Limit + simple cursor | Keyset |
+| Precision | `NUMERIC` + string API | Unchanged |
 | Reorg | `confirmationDepth` | Hash check + rollback |
 | Deploy | Docker Compose | API replicas + worker replicas |
 
-**Kết luận:** Trong 3 ngày, implement 1 process + 1 token + 4 bảng chính, nhưng **giữ khóa `(chain_id, token_address)`, module tách, write idempotent, checkpoint per token, và `SYNC_ENABLED`**. Đó là đường ngắn nhất để demo đúng, đồng thời mở rộng multi-token / tách worker / tăng throughput mà không redesign.
+**Conclusion:** In 3 days, implement 1 process + 1 token + 4 core tables, but **keep the `(chain_id, token_address)` key, separated modules, idempotent writes, a per-token checkpoint, and `SYNC_ENABLED`**. That is the shortest path to a correct demo, and it still leaves room to add tokens, split the worker, and raise throughput without a redesign.
