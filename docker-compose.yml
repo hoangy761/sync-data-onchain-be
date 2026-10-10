@@ -1,16 +1,32 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: indexer-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: "123456"
-      POSTGRES_DB: indexer
+  sync-data-onchain-be:
+    container_name: sync-data-onchain-be
+    image: ${DOCKER_IMAGE:-hoangy761/sync-data-onchain-be:latest}
+    build:
+      context: .
+      target: production
+    env_file:
+      - .env
     ports:
-      - "5432:5432"
-    volumes:
-      - indexer_pg_data:/var/lib/postgresql/data
-
-volumes:
-  indexer_pg_data:
+      - "${PORT:-9999}:9999"
+    environment:
+      PORT: 9999
+      NODE_ENV: production
+      RUN_MIGRATIONS: "true"
+      NODE_OPTIONS: --dns-result-order=ipv4first
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:9999/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped

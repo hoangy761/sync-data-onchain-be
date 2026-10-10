@@ -1,8 +1,30 @@
 import { parseRpcUrlList } from '../common/utils/rpc-url.util';
 
+const DEFAULT_CORS_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:4173',
+].join(',');
+
+function parseOriginList(value: string | undefined): string[] {
+  const seen = new Set<string>();
+  const origins: string[] = [];
+  for (const raw of (value ?? '').split(',')) {
+    const origin = raw.trim();
+    if (!origin || seen.has(origin)) {
+      continue;
+    }
+    seen.add(origin);
+    origins.push(origin);
+  }
+  return origins;
+}
+
 export default () => ({
   nodeEnv: process.env.NODE_ENV ?? 'development',
   port: parseInt(process.env.PORT ?? '3000', 10),
+  corsOrigins: parseOriginList(process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS),
   database: {
     host: process.env.DATABASE_HOST ?? 'localhost',
     port: parseInt(process.env.DATABASE_PORT ?? '5432', 10),
