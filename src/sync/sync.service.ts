@@ -20,6 +20,26 @@ import { TokensService } from '../tokens/tokens.service';
 import { CheckpointService } from './checkpoint.service';
 import { SyncCheckpoint } from './entities/sync-checkpoint.entity';
 
+/** Inclusive progress from the sync start block through the chain head, as "0.00"–"100.00". */
+export function syncPercent(
+  startBlock: string,
+  lastProcessedBlock: string,
+  currentBlock: string | null,
+): string | null {
+  if (currentBlock == null) return null;
+
+  const start = BigInt(startBlock);
+  const last = BigInt(lastProcessedBlock);
+  const current = BigInt(currentBlock);
+  const total = current >= start ? current - start + 1n : 1n;
+  const doneRaw = last + 1n > start ? last + 1n - start : 0n;
+  const done = doneRaw > total ? total : doneRaw;
+  const basisPoints = (done * 10000n) / total;
+  const whole = basisPoints / 100n;
+  const fraction = (basisPoints % 100n).toString().padStart(2, '0');
+  return `${whole}.${fraction}`;
+}
+
 @Injectable()
 export class SyncService {
   private readonly logger = new Logger(SyncService.name);
@@ -90,6 +110,11 @@ export class SyncService {
       latestBlock,
       safeHead,
       lagBlocks: lag,
+      syncPercent: syncPercent(
+        token.deploymentBlock,
+        checkpoint.lastProcessedBlock,
+        latestBlock,
+      ),
       updatedAt: checkpoint.updatedAt.toISOString(),
     };
   }

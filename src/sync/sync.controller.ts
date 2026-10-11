@@ -8,7 +8,10 @@ export class SyncController {
   constructor(private readonly syncService: SyncService) {}
 
   @Get(':chainId/:tokenAddress/sync-status')
-  @ApiOperation({ summary: 'Get sync progress for a token' })
+  @ApiOperation({
+    summary:
+      'Sync status for a token on a chain: start block, last processed block, chain head, and percent',
+  })
   getStatus(
     @Param('chainId', ParseIntPipe) chainId: number,
     @Param('tokenAddress') tokenAddress: string,
