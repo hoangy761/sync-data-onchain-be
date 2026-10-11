@@ -90,6 +90,7 @@ Copy `[.env.example](.env.example)`. Required values are validated at startup.
 | GET    | `/api/v1/chains/:chainId`                                       | Chain detail                                    |
 | GET    | `/api/v1/tokens`                                                | List tokens                                     |
 | GET    | `/api/v1/tokens/:chainId/:tokenAddress`                         | Token metadata                                  |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/top-holders`             | Top 100 indexed holder balances, highest first  |
 | GET    | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/balance` | Balance at head minus `SYNC_CONFIRMATION_DEPTH` |
 | GET    | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/history` | Balance history                                 |
 | GET    | `/api/v1/tokens/:chainId/:tokenAddress/sync-status`             | Sync progress                                   |

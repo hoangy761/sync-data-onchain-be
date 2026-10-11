@@ -6,18 +6,54 @@ import { normalizeAddress } from '../common/utils/address.util';
 import { formatTokenAmount } from '../common/utils/decimal.util';
 import { Token } from '../tokens/entities/token.entity';
 import { TokensService } from '../tokens/tokens.service';
+import { TokenBalance } from './entities/token-balance.entity';
 import { TokenBalanceHistory } from './entities/token-balance-history.entity';
 import { HolderBackfillService } from './holder-backfill.service';
+
+const TOP_HOLDER_LIMIT = 100;
 
 @Injectable()
 export class BalancesService {
   constructor(
     @InjectRepository(TokenBalanceHistory)
     private readonly historyRepo: Repository<TokenBalanceHistory>,
+    @InjectRepository(TokenBalance)
+    private readonly balancesRepo: Repository<TokenBalance>,
     private readonly tokensService: TokensService,
     private readonly holderBackfill: HolderBackfillService,
     private readonly config: ConfigService,
   ) {}
+
+  async getTopHolders(chainId: number, tokenAddress: string) {
+    const token = await this.tokensService.findOne(chainId, tokenAddress);
+    const rows = await this.balancesRepo
+      .createQueryBuilder('b')
+      .where('b.chain_id = :chainId', { chainId: token.chainId })
+      .andWhere('b.token_address = :tokenAddress', {
+        tokenAddress: token.tokenAddress,
+      })
+      .andWhere('b.balance > 0')
+      .orderBy('b.balance', 'DESC')
+      .addOrderBy('b.holder_address', 'ASC')
+      .limit(TOP_HOLDER_LIMIT)
+      .getMany();
+
+    const decimals = token.decimals ?? 0;
+    return {
+      chainId: token.chainId,
+      tokenAddress: token.tokenAddress,
+      symbol: token.symbol,
+      decimals,
+      limit: TOP_HOLDER_LIMIT,
+      holders: rows.map((row, index) => ({
+        rank: index + 1,
+        holderAddress: row.holderAddress,
+        balanceRaw: row.balance,
+        balanceFormatted: formatTokenAmount(row.balance, decimals),
+        updatedBlock: row.updatedBlock,
+      })),
+    };
+  }
 
   async getBalance(
     chainId: number,

@@ -14,6 +14,17 @@ import { BalancesService } from './balances.service';
 export class BalancesController {
   constructor(private readonly balancesService: BalancesService) {}
 
+  @Get(':chainId/:tokenAddress/top-holders')
+  @ApiOperation({
+    summary: 'Top 100 indexed holder balances, highest first',
+  })
+  getTopHolders(
+    @Param('chainId', ParseIntPipe) chainId: number,
+    @Param('tokenAddress') tokenAddress: string,
+  ) {
+    return this.balancesService.getTopHolders(chainId, tokenAddress);
+  }
+
   @Get(':chainId/:tokenAddress/holders/:holderAddress/balance')
   @ApiOperation({ summary: 'Get current holder balance' })
   getBalance(

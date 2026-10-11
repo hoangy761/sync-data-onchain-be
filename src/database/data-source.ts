@@ -10,6 +10,7 @@ import { TokenBalanceHistory } from '../balances/entities/token-balance-history.
 import { SyncCheckpoint } from '../sync/entities/sync-checkpoint.entity';
 import { ChainRpcEndpoints1740000001000 } from './migrations/1740000001000-ChainRpcEndpoints';
 import { HolderSyncTasks1740000002000 } from './migrations/1740000002000-HolderSyncTasks';
+import { TokenBalanceRankIndex1740000003000 } from './migrations/1740000003000-TokenBalanceRankIndex';
 import { InitSchema1740000000000 } from './migrations/1740000000000-InitSchema';
 
 loadEnv();
@@ -34,6 +35,7 @@ export default new DataSource({
     InitSchema1740000000000,
     ChainRpcEndpoints1740000001000,
     HolderSyncTasks1740000002000,
+    TokenBalanceRankIndex1740000003000,
   ],
   synchronize: false,
 });
