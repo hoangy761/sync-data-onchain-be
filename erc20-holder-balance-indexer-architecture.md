@@ -6,14 +6,16 @@ This document describes the system as it runs. Operational steps live in [README
 
 ## 1. Scope
 
-| In place | Deferred |
-| --- | --- |
-| One chain and one token, seeded from env | More tokens and chains through the same keys |
+
+| In place                                             | Deferred                                        |
+| ---------------------------------------------------- | ----------------------------------------------- |
+| More tokens and chains through the same keys         |                                                 |
 | API, sync worker, and holder catch-up in one process | Separate worker process or a queue, same schema |
-| Reorg exposure limited by `confirmationDepth` | Rollback and replay from `block_hash` |
-| Event-level `token_balance_history` | Raw `transfer_events` for audit and replay |
-| Keyset history cursor | Partitioning when history is large |
-| RPC fallback list in `chain_rpc_endpoints` | Admin APIs to add a token or trigger a resync |
+| Reorg exposure limited by `confirmationDepth`        |                                                 |
+| Event-level `token_balance_history`                  | Raw `transfer_events` for audit and replay      |
+| Keyset history cursor                                | Partitioning when history is large              |
+| RPC fallback list in `chain_rpc_endpoints`           | Admin APIs to add a token or trigger a resync   |
+
 
 Not every ERC-20 balance can be rebuilt from `Transfer` alone. Rebasing tokens and tokens with custom balance rules need their own reconciliation.
 
@@ -38,6 +40,8 @@ The balance endpoint therefore calls RPC. History after the first response is fi
 5. `SYNC_ENABLED=false` runs the API without the forward indexer.
 6. Schema changes go through migrations. `synchronize` stays off. See [schema source of truth](#14-schema-source-of-truth).
 
+
+
 ## 4. Runtime
 
 ```mermaid
@@ -61,6 +65,8 @@ flowchart TD
   CATCH --> RPC
   CATCH --> DB
 ```
+
+
 
 One NestJS process boots in this order:
 
@@ -107,14 +113,16 @@ A negative balance after the rewound baseline aborts the transaction.
 
 The balance response is immediate. History for a holder the indexer has not fully covered is filled by `holder_sync_tasks`.
 
-| Column | Meaning |
-| --- | --- |
-| `target_block` | Confirmed head the scan must reach |
-| `confirmed_balance` | Balance returned for that target |
-| `scan_from_block` | First block of this attempt. A restart moves `next_block` back here |
-| `next_block` | Next inclusive block to read |
-| `start_balance` | Balance at the end of `scan_from_block - 1` |
-| `status` | `pending`, `running`, `done`, or `failed` |
+
+| Column              | Meaning                                                             |
+| ------------------- | ------------------------------------------------------------------- |
+| `target_block`      | Confirmed head the scan must reach                                  |
+| `confirmed_balance` | Balance returned for that target                                    |
+| `scan_from_block`   | First block of this attempt. A restart moves `next_block` back here |
+| `next_block`        | Next inclusive block to read                                        |
+| `start_balance`     | Balance at the end of `scan_from_block - 1`                         |
+| `status`            | `pending`, `running`, `done`, or `failed`                           |
+
 
 Each cron tick takes the oldest `running` task, otherwise the oldest `pending` task, and scans up to 2000 blocks. The log reader still chunks those blocks into RPC ranges of at most 1000. History rows are inserted as each chunk commits. `token_balances` is updated when the scan reaches `target_block`.
 
@@ -138,6 +146,8 @@ CREATE TABLE chains (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
+
+
 
 ### 8.2. `chain_rpc_endpoints`
 
@@ -171,6 +181,8 @@ CREATE TABLE tokens (
     PRIMARY KEY (chain_id, token_address)
 );
 ```
+
+
 
 ### 8.4. `token_balances`
 
@@ -264,6 +276,8 @@ CREATE INDEX idx_holder_sync_tasks_status
 ON holder_sync_tasks (status, created_at);
 ```
 
+
+
 ## 9. Idempotency and locking
 
 Forward sync and holder catch-up both call `pg_advisory_xact_lock(chain_id, hashtext(token_address))` inside the write transaction. The lock disappears when the transaction ends. It serializes the two writers in this process and in any other session on the same database.
@@ -280,16 +294,18 @@ For each holder side of a log:
 
 Base path `/api/v1`. Swagger is mounted at `/docs` from `src/main.ts`.
 
-| Method | Path | Role |
-| --- | --- | --- |
-| GET | `/health` | Liveness. Excluded from the rate limit. |
-| GET | `/api/v1/chains` | List chains |
-| GET | `/api/v1/chains/:chainId` | Chain detail |
-| GET | `/api/v1/tokens` | List tokens |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress` | Token metadata |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/balance` | Confirmed balance |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/history` | Keyset history |
-| GET | `/api/v1/tokens/:chainId/:tokenAddress/sync-status` | Checkpoint, safe head, lag |
+
+| Method | Path                                                            | Role                                    |
+| ------ | --------------------------------------------------------------- | --------------------------------------- |
+| GET    | `/health`                                                       | Liveness. Excluded from the rate limit. |
+| GET    | `/api/v1/chains`                                                | List chains                             |
+| GET    | `/api/v1/chains/:chainId`                                       | Chain detail                            |
+| GET    | `/api/v1/tokens`                                                | List tokens                             |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress`                         | Token metadata                          |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/balance` | Confirmed balance                       |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/history` | Keyset history                          |
+| GET    | `/api/v1/tokens/:chainId/:tokenAddress/sync-status`             | Checkpoint, safe head, lag              |
+
 
 One rate-limit bucket per client IP covers the API. Over the limit the response is 429 with `Retry-After` and `X-RateLimit-*`. Production sits behind a proxy, so `TRUST_PROXY` must match the number of hops or every caller shares the loopback address.
 
@@ -334,23 +350,25 @@ Block numbers and raw amounts are strings.
 
 Validated at boot with Joi. Names below are the ones the process reads.
 
-| Variable | Required | Role |
-| --- | --- | --- |
-| `DATABASE_*` | Yes | External PostgreSQL |
-| `HYPEREVM_RPC_URL` | Yes | Primary RPC, seeded into `chains.rpc_url` |
-| `HYPEREVM_RPC_URL_FALLBACK` | No | Comma-separated fallbacks |
-| `CHAIN_ID`, `CHAIN_NAME` | `CHAIN_ID` yes | Seed chain. Defaults: `999`, `HyperEVM` |
-| `TOKEN_ADDRESS` | Yes | Seed token. Metadata is read on-chain |
-| `DAY_APP_DEPLOY` | Yes | Unix seconds. Empty-history copy starts at this time minus `SYNC_LOOKBACK_DAYS` |
-| `SYNC_LOOKBACK_DAYS` | No | Lookback used to estimate the seed start block. Default `7` |
-| `SYNC_ENABLED` | No | `false` skips the forward worker. Default `true` |
-| `SYNC_BLOCK_RANGE` | No | Forward-sync window. Stay within the 1000-block RPC cap |
-| `SYNC_CONFIRMATION_DEPTH` | No | Blocks behind head treated as confirmed. Default `12` |
-| `SYNC_POLL_INTERVAL_MS` | No | Worker interval once caught up |
-| `SYNC_RETRY_MAX_ATTEMPTS`, `SYNC_RETRY_BASE_DELAY_MS` | No | Backoff for a failed range |
-| `CORS_ORIGINS` | No | Browser origins. Defaults to the Vite dev and preview origins |
-| `RATE_LIMIT_TTL_MS`, `RATE_LIMIT_MAX` | No | Shared IP limit. Defaults `60000` and `120`. `/health` is excluded |
-| `TRUST_PROXY` | No | Proxy hops for `X-Forwarded-For`. Unset: `1` in production, off otherwise |
+
+| Variable                                              | Required       | Role                                                                            |
+| ----------------------------------------------------- | -------------- | ------------------------------------------------------------------------------- |
+| `DATABASE_*`                                          | Yes            | External PostgreSQL                                                             |
+| `HYPEREVM_RPC_URL`                                    | Yes            | Primary RPC, seeded into `chains.rpc_url`                                       |
+| `HYPEREVM_RPC_URL_FALLBACK`                           | No             | Comma-separated fallbacks                                                       |
+| `CHAIN_ID`, `CHAIN_NAME`                              | `CHAIN_ID` yes | Seed chain. Defaults: `999`, `HyperEVM`                                         |
+| `TOKEN_ADDRESS`                                       | Yes            | Seed token. Metadata is read on-chain                                           |
+| `DAY_APP_DEPLOY`                                      | Yes            | Unix seconds. Empty-history copy starts at this time minus `SYNC_LOOKBACK_DAYS` |
+| `SYNC_LOOKBACK_DAYS`                                  | No             | Lookback used to estimate the seed start block. Default `7`                     |
+| `SYNC_ENABLED`                                        | No             | `false` skips the forward worker. Default `true`                                |
+| `SYNC_BLOCK_RANGE`                                    | No             | Forward-sync window. Stay within the 1000-block RPC cap                         |
+| `SYNC_CONFIRMATION_DEPTH`                             | No             | Blocks behind head treated as confirmed. Default `12`                           |
+| `SYNC_POLL_INTERVAL_MS`                               | No             | Worker interval once caught up                                                  |
+| `SYNC_RETRY_MAX_ATTEMPTS`, `SYNC_RETRY_BASE_DELAY_MS` | No             | Backoff for a failed range                                                      |
+| `CORS_ORIGINS`                                        | No             | Browser origins. Defaults to the Vite dev and preview origins                   |
+| `RATE_LIMIT_TTL_MS`, `RATE_LIMIT_MAX`                 | No             | Shared IP limit. Defaults `60000` and `120`. `/health` is excluded              |
+| `TRUST_PROXY`                                         | No             | Proxy hops for `X-Forwarded-For`. Unset: `1` in production, off otherwise       |
+
 
 `TOKEN_SYMBOL`, `TOKEN_DECIMALS`, and `SYNC_START_BLOCK` are not configuration. Symbol and decimals come from the contract. The start block is estimated.
 
@@ -384,14 +402,18 @@ src/
 └── common/utils/
 ```
 
-| Module | Responsibility |
-| --- | --- |
-| `blockchain` | Viem client, logs, `balanceOf`, head rewind |
-| `chains` | Chain rows and RPC endpoint sync |
-| `tokens` | Metadata and the one-token seed |
-| `sync` | Forward indexer and sync status |
-| `balances` | Balance and history API, holder catch-up |
-| `bootstrap` | Seed chain, then token, before the worker starts |
+
+| Module       | Responsibility                                   |
+| ------------ | ------------------------------------------------ |
+| `blockchain` | Viem client, logs, `balanceOf`, head rewind      |
+| `chains`     | Chain rows and RPC endpoint sync                 |
+| `tokens`     | Metadata and the one-token seed                  |
+| `sync`       | Forward indexer and sync status                  |
+| `balances`   | Balance and history API, holder catch-up         |
+| `bootstrap`  | Seed chain, then token, before the worker starts |
+
+
+
 
 ## 13. Deferred
 
@@ -403,6 +425,8 @@ src/
 - A queue or one worker per token. The advisory lock stays the write gate.
 - Partition `token_balance_history` by block or time once it is large. Keep the unique key compatible with the partition key.
 - Share the rewind cache if more than one process serves balance reads. Today it is in memory.
+
+
 
 ## 14. Schema source of truth
 
