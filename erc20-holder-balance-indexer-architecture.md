@@ -1,216 +1,165 @@
 # ERC-20 Holder Balance Indexer
 
-## 1. Overview
+NestJS service that indexes one HyperEVM ERC-20 into PostgreSQL and exposes a Swagger API for confirmed balances, transfer history, and sync progress.
 
-### Goal
+This document describes the system as it runs. Operational steps live in [README.md](README.md).
 
-Build a service that syncs ERC-20 holder balances (for example USDC) from the blockchain into PostgreSQL, with a Swagger API to query:
+## 1. Scope
 
-- The current balance of an address.
-- Balance-change history for each `Transfer` event.
-- Transaction and block details, plus the balance increase or decrease.
-- Sync progress for each token.
+| In place | Deferred |
+| --- | --- |
+| One chain and one token, seeded from env | More tokens and chains through the same keys |
+| API, sync worker, and holder catch-up in one process | Separate worker process or a queue, same schema |
+| Reorg exposure limited by `confirmationDepth` | Rollback and replay from `block_hash` |
+| Event-level `token_balance_history` | Raw `transfer_events` for audit and replay |
+| Keyset history cursor | Partitioning when history is large |
+| RPC fallback list in `chain_rpc_endpoints` | Admin APIs to add a token or trigger a resync |
 
-**Principle:** ship an MVP in about 3 days, but design the seams up front so the system can scale later (more tokens/chains, a separate worker, higher throughput) without rewriting the schema or the core sync flow.
+Not every ERC-20 balance can be rebuilt from `Transfer` alone. Rebasing tokens and tokens with custom balance rules need their own reconciliation.
 
-### Technology (locked in)
+## 2. HyperEVM constraints
 
-- **Backend:** NestJS + TypeScript
-- **Database:** PostgreSQL
-- **ORM:** TypeORM + migrations (`synchronize: false`)
-- **API docs:** Swagger / OpenAPI (`@nestjs/swagger`)
-- **Blockchain:** `viem` + EVM JSON-RPC
+These constraints decide the read path. They are not optional optimizations.
 
-### Scope by phase
+- `balanceOf(holder)` is reliable only at the current head. The same call at any older block returns 0.
+- A confirmed balance is `balanceOf(head)` minus the net `Transfer` delta after `head - SYNC_CONFIRMATION_DEPTH`.
+- `eth_getLogs` rejects a range wider than 1000 blocks. `TransferLogReader` chunks inside that cap. Prefer `SYNC_BLOCK_RANGE` at or below 100, because the provider also rate-limits.
+- Far-history block heights are rejected. The seed start block is estimated from recent block time, then adjusted to the nearest block the RPC will serve.
+- The rewind delta cache in `BalanceRewindService` lives in the process. Another replica does not see it.
 
-| | Within 3 days (MVP) | Later scale (seams already in place) |
-| --- | --- | --- |
-| Chain / token | 1 chain + 1 token (seeded via env) | Many tokens / many chains via the `tokens` table |
-| Process | API + worker in one NestJS process | Separate worker process / queue, same DB schema |
-| Reorg | Sync only up to `head - confirmationDepth` | Rollback/replay by `block_hash` |
-| Raw events | Not required | Add `transfer_events` when audit/replay is needed |
-| Pagination | `limit` + a simple cursor | Stable keyset pagination when history is large |
-| Partition | None | Partition history by block/time when it is large enough |
+The balance endpoint therefore calls RPC. History after the first response is filled from the database by a background catch-up. Do not "fix" the balance route back to a database-only read.
 
-> Note: not every ERC-20 token yields a correct balance from `Transfer` events alone. Rebasing tokens and tokens with special balance rules need their own reconciliation (Phase 2+).
+## 3. Principles that still hold
 
----
+1. Every balance, history, and checkpoint row is keyed by `(chain_id, token_address, ...)`.
+2. `blockchain` talks to RPC. `sync` indexes forward. `balances` serves reads and catch-up. `tokens` and `chains` own metadata.
+3. A history row is written once. The balance moves only for a new history row. Checkpoint, history, and balance commit in one transaction.
+4. Amounts are `NUMERIC`, never float. The API returns them as strings.
+5. `SYNC_ENABLED=false` runs the API without the forward indexer.
+6. Schema changes go through migrations. `synchronize` stays off. See [schema source of truth](#14-schema-source-of-truth).
 
-## 1.1. Scale-ready principles (apply from the MVP)
-
-Get these right from the start; **do not** build all of Phase 2/3 in the 3 days:
-
-1. **Multi-dimensional schema:** every main table is keyed by `(chain_id, token_address, ...)`. The MVP seeds one token, but the schema is already multi-token / multi-chain.
-2. **Clear module boundaries:** `blockchain` (RPC) / `sync` (indexer) / `balances` (read API) / `tokens` (metadata). Splitting the worker later means enabling the `sync` module in another process, without touching the API.
-3. **Idempotent write path:** a unique key per event, and apply the balance exactly once inside a DB transaction. This is the foundation for safe retries and multi-worker writes later.
-4. **Checkpoint per token:** `sync_checkpoints` keyed by `(chain_id, token_address)` — scale horizontally by token without a shared checkpoint.
-5. **NUMERIC + string API:** avoid a precision rewrite when volume grows.
-6. **Config via env:** RPC, batch size, confirmation depth, poll interval — tune throughput without changing code.
-7. **API reads the DB only:** do not call RPC on the hot path; adding a cache or read replica later does not break the contract.
-8. **Process feature flag:** `SYNC_ENABLED=true|false` so the same codebase can run API-only or worker-only.
-
-**Intentionally out of the MVP (avoid over-engineering):** a queue (Bull/Kafka), a distributed lock, partitioning, complex multi-RPC failover, a full metrics stack, and top holders unless the brief requires them.
-
----
-
-## 2. Problem statement
-
-Given an ERC-20 token, for example USDC, build a system that tracks the balance of each holder.
-
-The system must meet these requirements:
-
-1. Read `Transfer` events from the blockchain by block range.
-2. Determine the balance change for the sender and the receiver.
-3. Store the current balance so the API can query it quickly.
-4. Store history so balance changes can be inspected over time.
-5. Do not write the same event twice when the worker retries.
-6. Do not update a balance twice if a batch is processed again.
-7. Store a checkpoint so sync can resume after a service restart.
-8. Have a strategy for RPC timeout / rate limit; handle reorgs minimally via `confirmationDepth` (full rollback is Phase 2).
-9. Provide a Swagger API for testing and integration.
-10. Keep token amounts exact; do not use floating point for on-chain balances.
-
-### Primary queries
-
-**MVP**
-
-- Get the current balance of a holder.
-- Get a holder's balance history in time order (`limit` / cursor).
-- Get the token's sync progress.
-- Get metadata for the token being tracked.
-
-**Later scale / optional**
-
-- Filter history by block range or time range.
-- Top holders (`ORDER BY balance DESC` plus a secondary index when needed).
-- Admin: add a token / trigger a resync via the API.
-
----
-
-## 3. System architecture
-
-### 3.0. MVP (1 process) vs scale (split processes)
-
-```mermaid
-flowchart LR
-  subgraph mvp [MVP - single process]
-    APP[NestJS App]
-    APP --> API1[Balances API]
-    APP --> W1[Sync Worker]
-  end
-
-  subgraph scale [Scale later - same schema]
-    API2[API process]
-    W2[Worker process]
-    Q[Optional queue]
-    W2 --> Q
-  end
-
-  DB[(PostgreSQL)]
-  RPC[JSON-RPC]
-
-  W1 --> RPC
-  W1 --> DB
-  API1 --> DB
-  W2 --> RPC
-  W2 --> DB
-  API2 --> DB
-```
-
-Same schema + same module boundaries → scale by splitting deploys / toggling `SYNC_ENABLED`, without a redesign.
-
-### 3.1. Data flow
+## 4. Runtime
 
 ```mermaid
 flowchart TD
-    RPC[Blockchain JSON-RPC]
-    SYNC[Sync Worker / Indexer]
-    DECODE[Decode Transfer Events]
-    BATCH[Normalize and Aggregate Batch]
-    TX[PostgreSQL Transaction]
-    BAL[(token_balances)]
-    HIST[(token_balance_history)]
-    EVENT[(transfer_events - optional)]
-    CHECK[(sync_checkpoints)]
-    API[NestJS REST API]
-    SWAGGER[Swagger UI / OpenAPI]
-    CLIENT[Frontend / External Client]
+  RPC[HyperEVM JSON-RPC]
+  BOOT[Bootstrap seed]
+  WORKER[Sync worker]
+  REWIND[Balance rewind]
+  CATCH[Holder catch-up]
+  DB[(PostgreSQL)]
+  API[REST API]
 
-    RPC --> SYNC
-    SYNC --> DECODE
-    DECODE --> BATCH
-    BATCH --> TX
-    TX --> BAL
-    TX --> HIST
-    TX --> EVENT
-    TX --> CHECK
-    CLIENT --> API
-    SWAGGER --> API
-    API --> BAL
-    API --> HIST
-    API --> CHECK
+  BOOT --> RPC
+  BOOT --> DB
+  WORKER --> RPC
+  WORKER --> REWIND
+  WORKER --> DB
+  API --> REWIND
+  API --> DB
+  REWIND --> RPC
+  CATCH --> RPC
+  CATCH --> DB
 ```
 
-### Components
+One NestJS process boots in this order:
 
-#### 3.2. Blockchain RPC
+1. Migrations run.
+2. If `chains` is empty, seed HyperEVM from `CHAIN_ID`, `CHAIN_NAME`, and `HYPEREVM_RPC_URL`. Fallback URLs are written to `chain_rpc_endpoints`.
+3. If `tokens` is empty, read `name`, `symbol`, and `decimals` on-chain, estimate the start block as now minus `SYNC_LOOKBACK_DAYS`, then insert the token and a checkpoint at that block minus one.
+4. When `SYNC_ENABLED=true`, the worker polls enabled tokens.
+5. A cron every 10 seconds advances the oldest `holder_sync_tasks` row.
 
-- Read blocks and `Transfer` logs by block range.
-- Fetch the timestamp and block hash for each event.
-- Cap the block range to the provider limit (`SYNC_BLOCK_RANGE`).
-- Retry with exponential backoff on transient errors (timeout, 429).
-- **Later scale:** add an RPC fallback list / provider pool without changing the `TransferLogReader` contract.
+`tokens.chain_id` references `chains.chain_id`. After seed, RPC calls use the URLs stored for that chain. `RpcClientFactory` tries the primary URL, then enabled fallbacks. A provider rate-limit (`429`, CU limit, timeout) cools that URL down for 10 seconds and the next URL is tried.
 
-#### 3.3. Sync worker / indexer
+PostgreSQL is external. `docker-compose.yml` runs only the API.
 
-The worker:
+## 5. Balance read
 
-1. Reads the current checkpoint (per token).
-2. Determines the next block range; safe head = `latest - confirmationDepth`.
-3. Fetches logs from RPC.
-4. Sorts logs by `blockNumber`, `transactionIndex`, `logIndex`.
-5. Decodes events and normalizes addresses (lowercase).
-6. Computes the delta for each holder.
-7. Writes history, updates the current balance, and updates the checkpoint in **one** DB transaction.
-8. Marks the range complete only after a successful commit.
+`GET .../balance` does not wait for historical indexing.
 
-MVP: one sequential worker loop over `enabled` tokens. Do not process the same token in parallel until a lock exists.
+1. Load the enabled chain and its RPC URL.
+2. Read head `balanceOf`.
+3. Subtract holder deltas from `safeHead + 1` through head. `safeHead` is `head - SYNC_CONFIRMATION_DEPTH`.
+4. Return that balance with `balanceSource: "confirmed"` and `updatedBlock` set to `safeHead`.
+5. Schedule a catch-up so later history requests can be served from the database. The zero address is not scheduled.
 
-**Later scale:** one worker process per token / per chain; or a queue job keyed by `(chainId, tokenAddress, fromBlock, toBlock)`.
+Concurrent reads for the same holder share one in-flight rewind.
 
-#### 3.4. PostgreSQL
+Empty history returns `message` computed from `DAY_APP_DEPLOY` minus `SYNC_LOOKBACK_DAYS`. That string is a product boundary, not proof that the address never held the token before the lookback.
 
-- `tokens`: metadata + `deployment_block` / start block.
-- `token_balances`: current balances.
-- `token_balance_history`: per-event history.
-- `sync_checkpoints`: sync progress.
-- `transfer_events` (Phase 2): raw logs for replay / audit / reorg.
+## 6. Forward sync
 
-#### 3.5. NestJS API
+For each enabled token the worker:
 
-The API only serves already-synced data; it does not call RPC for ordinary balance reads.
+1. Loads the checkpoint and the chain head.
+2. Sets `safeHead = head - confirmationDepth`. The next range starts at `last_processed_block + 1` and is capped by `SYNC_BLOCK_RANGE` and `safeHead`.
+3. Fetches and decodes `Transfer` logs. Order is `block_number`, `transaction_index`, `log_index`. Addresses are lowercase.
+4. For a holder with no `token_balances` row, rewinds a baseline to the end of the block before the range. That baseline is `balanceOf(head)` minus every `Transfer` after the target block.
+5. Inside one database transaction, takes the token write lock, writes history and balances, then advances the checkpoint and `last_block_hash` to the end block.
+6. Retries the range with exponential backoff. A failed attempt rolls back, so the checkpoint does not move.
 
-Swagger is served via `@nestjs/swagger` at `/docs`.
+Mint (`from` is the zero address) only credits the receiver. Burn only debits the sender. A self-transfer writes one history row with delta 0. Several transfers for the same holder in one range stay in log order.
 
----
+A negative balance after the rewound baseline aborts the transaction.
 
-## 4. Database design
+## 7. Holder history catch-up
 
-### 4.1. Principles
+The balance response is immediate. History for a holder the indexer has not fully covered is filled by `holder_sync_tasks`.
 
-- Each token: `chain_id + token_address`.
-- Each holder: `chain_id + token_address + holder_address`.
-- Normalize addresses to lowercase when using `VARCHAR`.
-- Store balances as raw integer units; do not divide by `10 ** decimals` in the DB.
-- Use `NUMERIC`, not `FLOAT` / `REAL`.
-- The API returns raw amounts as strings.
-- `decimals` / `symbol` live on the `tokens` table.
+| Column | Meaning |
+| --- | --- |
+| `target_block` | Confirmed head the scan must reach |
+| `confirmed_balance` | Balance returned for that target |
+| `scan_from_block` | First block of this attempt. A restart moves `next_block` back here |
+| `next_block` | Next inclusive block to read |
+| `start_balance` | Balance at the end of `scan_from_block - 1` |
+| `status` | `pending`, `running`, `done`, or `failed` |
 
-### 4.2. Table `tokens`
+Each cron tick takes the oldest `running` task, otherwise the oldest `pending` task, and scans up to 2000 blocks. The log reader still chunks those blocks into RPC ranges of at most 1000. History rows are inserted as each chunk commits. `token_balances` is updated when the scan reaches `target_block`.
+
+The same token write lock used by the forward sync covers these writes.
+
+## 8. Database
+
+Addresses are lowercase `VARCHAR(42)`. Balances are raw integer units. `decimals` lives on `tokens`.
+
+`tokens.deployment_block` is the estimated lookback start, not necessarily the contract creation block.
+
+### 8.1. `chains`
+
+```sql
+CREATE TABLE chains (
+    chain_id    INTEGER PRIMARY KEY,
+    name        VARCHAR(64) NOT NULL,
+    rpc_url     TEXT NOT NULL,
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 8.2. `chain_rpc_endpoints`
+
+```sql
+CREATE TABLE chain_rpc_endpoints (
+    id          SERIAL PRIMARY KEY,
+    chain_id    INTEGER NOT NULL REFERENCES chains (chain_id) ON DELETE CASCADE,
+    url         TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (chain_id, url)
+);
+```
+
+Env fallbacks are synced into this table on chain load. URLs removed from env are disabled, not deleted.
+
+### 8.3. `tokens`
 
 ```sql
 CREATE TABLE tokens (
-    chain_id          INTEGER NOT NULL,
+    chain_id          INTEGER NOT NULL REFERENCES chains (chain_id) ON DELETE RESTRICT,
     token_address     VARCHAR(42) NOT NULL,
     symbol            VARCHAR(32),
     name              VARCHAR(128),
@@ -219,14 +168,11 @@ CREATE TABLE tokens (
     enabled           BOOLEAN NOT NULL DEFAULT TRUE,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     PRIMARY KEY (chain_id, token_address)
 );
 ```
 
-MVP: seed one row from env at bootstrap. Scale: add tokens via insert / an admin API later.
-
-### 4.3. Table `token_balances`
+### 8.4. `token_balances`
 
 ```sql
 CREATE TABLE token_balances (
@@ -237,26 +183,16 @@ CREATE TABLE token_balances (
     updated_block     BIGINT NOT NULL,
     updated_log_index INTEGER,
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     PRIMARY KEY (chain_id, token_address, holder_address),
     CHECK (balance >= 0)
 );
 ```
 
-Notes:
+There is no foreign key to `tokens` yet. Add `REFERENCES tokens (chain_id, token_address) ON DELETE RESTRICT` on this table, `token_balance_history`, `sync_checkpoints`, and `holder_sync_tasks` when a second token makes orphans expensive. A top-holders index on `(chain_id, token_address, balance DESC)` waits until that query exists.
 
-- A PK lookup is enough for current-balance reads in the MVP.
-- A row may be deleted when the balance is 0; the API treats a missing row as 0. If "every holder that ever appeared" is required, keep the zero-balance row.
-- **Scale — top holders:** add this index only when it is actually needed:
+### 8.5. `token_balance_history`
 
-```sql
-CREATE INDEX idx_token_balances_top
-ON token_balances (chain_id, token_address, balance DESC);
-```
-
-### 4.4. Table `token_balance_history`
-
-One `Transfer` usually creates at most two rows (sender + receiver). Mint/burn against the zero address has its own rules.
+One `Transfer` writes at most two rows. The unique key does not include `token_address`: `log_index` already identifies one log, and one log belongs to one token contract. `holder_address` is required because the sender and receiver are two rows.
 
 ```sql
 CREATE TABLE token_balance_history (
@@ -264,47 +200,32 @@ CREATE TABLE token_balance_history (
     chain_id          INTEGER NOT NULL,
     token_address     VARCHAR(42) NOT NULL,
     holder_address    VARCHAR(42) NOT NULL,
-
     block_number      BIGINT NOT NULL,
     block_hash        VARCHAR(66) NOT NULL,
     block_timestamp   TIMESTAMPTZ NOT NULL,
     transaction_index INTEGER NOT NULL,
     tx_hash           VARCHAR(66) NOT NULL,
     log_index         INTEGER NOT NULL,
-
     balance_before    NUMERIC(78, 0) NOT NULL,
     balance_after     NUMERIC(78, 0) NOT NULL,
     delta             NUMERIC(80, 0) NOT NULL,
-
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     UNIQUE (chain_id, tx_hash, log_index, holder_address)
 );
-```
 
-```sql
 CREATE INDEX idx_balance_history_holder_order
 ON token_balance_history (
-    chain_id,
-    token_address,
-    holder_address,
-    block_number DESC,
-    transaction_index DESC,
-    log_index DESC
+    chain_id, token_address, holder_address,
+    block_number DESC, transaction_index DESC, log_index DESC
 );
 
--- Optional when querying or handling reorgs by block
 CREATE INDEX idx_balance_history_block
-ON token_balance_history (
-    chain_id,
-    token_address,
-    block_number
-);
+ON token_balance_history (chain_id, token_address, block_number);
 ```
 
-`delta` uses `NUMERIC(80,0)` so a signed difference near the `uint256` limit stays safe.
+`delta` is `NUMERIC(80,0)` so a signed value near the `uint256` limit still fits.
 
-### 4.5. Table `sync_checkpoints`
+### 8.6. `sync_checkpoints`
 
 ```sql
 CREATE TABLE sync_checkpoints (
@@ -313,230 +234,88 @@ CREATE TABLE sync_checkpoints (
     last_processed_block BIGINT NOT NULL,
     last_block_hash      VARCHAR(66),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     PRIMARY KEY (chain_id, token_address)
 );
 ```
 
-Do not advance the checkpoint before the balance and history commit succeeds.
+The checkpoint moves only in the transaction that wrote the range.
 
-### 4.6. Table `transfer_events` (Phase 2 — optional)
-
-Enable this when replay, audit, or easier reorg handling is needed. **Not required for the MVP.**
+### 8.7. `holder_sync_tasks`
 
 ```sql
-CREATE TABLE transfer_events (
+CREATE TABLE holder_sync_tasks (
+    id                SERIAL PRIMARY KEY,
     chain_id          INTEGER NOT NULL,
     token_address     VARCHAR(42) NOT NULL,
-    block_number      BIGINT NOT NULL,
-    block_hash        VARCHAR(66) NOT NULL,
-    transaction_index INTEGER NOT NULL,
-    tx_hash           VARCHAR(66) NOT NULL,
-    log_index         INTEGER NOT NULL,
-    from_address      VARCHAR(42) NOT NULL,
-    to_address        VARCHAR(42) NOT NULL,
-    value             NUMERIC(78, 0) NOT NULL,
+    holder_address    VARCHAR(42) NOT NULL,
+    target_block      BIGINT NOT NULL,
+    confirmed_balance NUMERIC(78, 0) NOT NULL,
+    scan_from_block   BIGINT NOT NULL,
+    next_block        BIGINT NOT NULL,
+    start_balance     NUMERIC(78, 0),
+    status            VARCHAR(16) NOT NULL,
+    last_error        TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    PRIMARY KEY (chain_id, tx_hash, log_index)
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (chain_id, token_address, holder_address)
 );
 
-CREATE INDEX idx_transfer_events_block
-ON transfer_events (chain_id, token_address, block_number);
+CREATE INDEX idx_holder_sync_tasks_status
+ON holder_sync_tasks (status, created_at);
 ```
 
----
+## 9. Idempotency and locking
 
-## 5. Transfer event processing
+Forward sync and holder catch-up both call `pg_advisory_xact_lock(chain_id, hashtext(token_address))` inside the write transaction. The lock disappears when the transaction ends. It serializes the two writers in this process and in any other session on the same database.
 
-Example: `Transfer(A, B, 100)` where A=500 and B=200 before the event:
+For each holder side of a log:
 
-- A: before=500, delta=-100, after=400
-- B: before=200, delta=+100, after=300
+1. If `(chain_id, tx_hash, log_index, holder_address)` already exists, skip that side.
+2. Otherwise insert history, then save the new balance.
+3. A unique violation rolls the whole transaction back, including the checkpoint.
 
-### Processing one block range
+`SELECT ... FOR UPDATE` on balance rows is the later step if several workers apply different ranges of the same token at once. The advisory lock is enough while one process owns a token.
 
-1. Fetch logs in `[from, to]`, with `to <= latest - confirmationDepth`.
-2. Sort by `block_number`, `transaction_index`, `log_index`.
-3. Decode the event.
-4. Identify sender / receiver (mint / burn / self-transfer).
-5. Read the current balance of each affected holder (inside the transaction; `SELECT ... FOR UPDATE` when scaling to multiple writers).
-6. Compute `balance_before`, `delta`, `balance_after`.
-7. Insert history (`ON CONFLICT DO NOTHING` / fail-and-skip if the row already exists — keep the idempotency rule explicit).
-8. Update the current balance **only when** the history row is newly written.
-9. Update the checkpoint and `last_block_hash`.
-10. Commit.
+## 10. API
 
-### Duplicate protection and retries
+Base path `/api/v1`. Swagger is mounted at `/docs` from `src/main.ts`.
 
-A unique constraint on history **is not enough** if a conflict still increments the balance. Pick one rule and keep it everywhere:
-
-- Insert history first; apply the balance only when the insert succeeds (a new row).
-- Or write a unique raw event first (Phase 2), then apply the balance only for new events.
-
-A failed batch → roll back the whole transaction → retry. Do not commit the checkpoint early.
-
-### Edge cases
-
-- Mint: `from` is the zero address.
-- Burn: `to` is the zero address.
-- Self-transfer: net delta is 0; avoid a bad double-apply.
-- Several transfers for the same holder in one block: preserve log order; history stays event-level.
-- Reorg (MVP): avoid it with `confirmationDepth`. Phase 2: compare `block_hash`, roll back from the diverging block, then replay.
-
----
-
-## 6. Read/write optimization
-
-### Read: current balance
-
-```sql
-SELECT balance, updated_block
-FROM token_balances
-WHERE chain_id = $1
-  AND token_address = LOWER($2)
-  AND holder_address = LOWER($3);
-```
-
-### Read: history
-
-```sql
-SELECT
-    block_number,
-    block_timestamp,
-    tx_hash,
-    log_index,
-    balance_before,
-    balance_after,
-    delta
-FROM token_balance_history
-WHERE chain_id = $1
-  AND token_address = LOWER($2)
-  AND holder_address = LOWER($3)
-ORDER BY block_number DESC, transaction_index DESC, log_index DESC
-LIMIT $4;
-```
-
-MVP: a simple cursor based on `(block_number, transaction_index, log_index)`. Scale: keyset pagination; avoid a large `OFFSET`.
-
-### Write
-
-- Batch a few hundred to a few thousand logs; tune with `SYNC_BLOCK_RANGE`.
-- Bulk-insert history.
-- Aggregate deltas for the current balance in the batch **after** history has been written in the correct order.
-- MVP: one sequential worker. Scale: limit concurrency per token and use row locks.
-
-### Partitioning
-
-Not needed at the start. When history is very large, partition by block or time; design the unique constraint so it is compatible with the partition key.
-
----
-
-## 7. NestJS project structure
-
-```text
-src/
-├── app.module.ts
-├── main.ts
-├── config/
-│   ├── configuration.ts
-│   └── validation.ts
-├── database/
-│   ├── database.module.ts
-│   └── migrations/
-├── blockchain/
-│   ├── blockchain.module.ts
-│   ├── rpc.client.ts
-│   ├── transfer-log.reader.ts
-│   └── abi/
-│       └── erc20.abi.ts
-├── tokens/
-│   ├── tokens.module.ts
-│   ├── tokens.controller.ts
-│   ├── tokens.service.ts
-│   ├── dto/
-│   └── entities/
-│       └── token.entity.ts
-├── balances/
-│   ├── balances.module.ts
-│   ├── balances.controller.ts
-│   ├── balances.service.ts
-│   ├── dto/
-│   └── entities/
-│       ├── token-balance.entity.ts
-│       └── token-balance-history.entity.ts
-├── sync/
-│   ├── sync.module.ts
-│   ├── sync.service.ts
-│   ├── sync.worker.ts
-│   ├── checkpoint.service.ts
-│   └── dto/
-└── common/
-    ├── filters/
-    ├── interceptors/
-    ├── pipes/
-    └── utils/
-```
-
-### Module responsibilities
-
-| Module | MVP | Scale path |
+| Method | Path | Role |
 | --- | --- | --- |
-| `blockchain` | 1 RPC client | Provider pool / failover |
-| `sync` | Loop in the same process (`SYNC_ENABLED`) | Separate process / queue jobs |
-| `tokens` | Seed 1 token from env | CRUD for many tokens |
-| `balances` | Read API | Cache / read replica |
-| `database` | Migrations | Partition / connection-pool tuning |
+| GET | `/health` | Liveness. Excluded from the rate limit. |
+| GET | `/api/v1/chains` | List chains |
+| GET | `/api/v1/chains/:chainId` | Chain detail |
+| GET | `/api/v1/tokens` | List tokens |
+| GET | `/api/v1/tokens/:chainId/:tokenAddress` | Token metadata |
+| GET | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/balance` | Confirmed balance |
+| GET | `/api/v1/tokens/:chainId/:tokenAddress/holders/:holder/history` | Keyset history |
+| GET | `/api/v1/tokens/:chainId/:tokenAddress/sync-status` | Checkpoint, safe head, lag |
 
-Do not enable `synchronize: true` in a real environment.
+One rate-limit bucket per client IP covers the API. Over the limit the response is 429 with `Retry-After` and `X-RateLimit-*`. Production sits behind a proxy, so `TRUST_PROXY` must match the number of hops or every caller shares the loopback address.
 
-### Suggested bootstrap
-
-- `SYNC_ENABLED=true`: start the worker after the app is listening.
-- `SYNC_ENABLED=false`: API-only (ready to scale reads horizontally).
-
----
-
-## 8. Swagger REST API
-
-Base path: `/api/v1`
-
-| Method | Endpoint | MVP | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/health` | Yes | Liveness |
-| `GET` | `/tokens` | Yes | Token list |
-| `GET` | `/tokens/:chainId/:tokenAddress` | Yes | Metadata |
-| `GET` | `/tokens/:chainId/:tokenAddress/holders/:holderAddress/balance` | Yes | Current balance |
-| `GET` | `/tokens/:chainId/:tokenAddress/holders/:holderAddress/history` | Yes | History + cursor |
-| `GET` | `/tokens/:chainId/:tokenAddress/sync-status` | Yes | Checkpoint / lag |
-| `GET` | `/tokens/:chainId/:tokenAddress/holders/top` | Optional | Scale / if the brief requires it |
-| `POST` | `/tokens` | Optional | Admin: add a token |
-| `POST` | `/tokens/:chainId/:tokenAddress/sync` | Optional | Admin: resync |
-
-### Example: current balance
+Balance:
 
 ```json
 {
-  "chainId": 1,
-  "tokenAddress": "0xTOKEN",
-  "holderAddress": "0xAAA",
+  "chainId": 999,
+  "tokenAddress": "0xabc...",
+  "holderAddress": "0xdef...",
   "balanceRaw": "1500000",
   "decimals": 6,
   "balanceFormatted": "1.5",
-  "updatedBlock": "22000000"
+  "updatedBlock": "22000000",
+  "balanceSource": "confirmed"
 }
 ```
 
-`balanceRaw` and block numbers are returned as strings. `balanceFormatted` uses a decimal-safe formatter.
-
-### Example: history
+History uses a base64url cursor over `(blockNumber, transactionIndex, logIndex)`, compared with a tuple predicate. There is no `OFFSET`.
 
 ```json
 {
   "items": [
     {
       "blockNumber": "22000000",
-      "timestamp": "2026-10-09T12:00:00Z",
+      "timestamp": "2026-10-09T12:00:00.000Z",
       "txHash": "0x...",
       "logIndex": 3,
       "deltaRaw": "500000",
@@ -544,198 +323,89 @@ Base path: `/api/v1`
       "balanceAfterRaw": "1500000"
     }
   ],
-  "nextCursor": null
+  "nextCursor": null,
+  "message": null
 }
 ```
 
-### Swagger bootstrap
+Block numbers and raw amounts are strings.
 
-```typescript
-import { NestFactory } from '@nestjs/core';
-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
-import { AppModule } from './app.module';
+## 11. Configuration
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+Validated at boot with Joi. Names below are the ones the process reads.
 
-  const config = new DocumentBuilder()
-    .setTitle('ERC-20 Balance Indexer API')
-    .setDescription(
-      'API for current ERC-20 holder balances, balance history, and sync status.',
-    )
-    .setVersion('1.0.0')
-    .addTag('Tokens')
-    .addTag('Balances')
-    .addTag('Sync')
-    .build();
+| Variable | Required | Role |
+| --- | --- | --- |
+| `DATABASE_*` | Yes | External PostgreSQL |
+| `HYPEREVM_RPC_URL` | Yes | Primary RPC, seeded into `chains.rpc_url` |
+| `HYPEREVM_RPC_URL_FALLBACK` | No | Comma-separated fallbacks |
+| `CHAIN_ID`, `CHAIN_NAME` | `CHAIN_ID` yes | Seed chain. Defaults: `999`, `HyperEVM` |
+| `TOKEN_ADDRESS` | Yes | Seed token. Metadata is read on-chain |
+| `DAY_APP_DEPLOY` | Yes | Unix seconds. Empty-history copy starts at this time minus `SYNC_LOOKBACK_DAYS` |
+| `SYNC_LOOKBACK_DAYS` | No | Lookback used to estimate the seed start block. Default `7` |
+| `SYNC_ENABLED` | No | `false` skips the forward worker. Default `true` |
+| `SYNC_BLOCK_RANGE` | No | Forward-sync window. Stay within the 1000-block RPC cap |
+| `SYNC_CONFIRMATION_DEPTH` | No | Blocks behind head treated as confirmed. Default `12` |
+| `SYNC_POLL_INTERVAL_MS` | No | Worker interval once caught up |
+| `SYNC_RETRY_MAX_ATTEMPTS`, `SYNC_RETRY_BASE_DELAY_MS` | No | Backoff for a failed range |
+| `CORS_ORIGINS` | No | Browser origins. Defaults to the Vite dev and preview origins |
+| `RATE_LIMIT_TTL_MS`, `RATE_LIMIT_MAX` | No | Shared IP limit. Defaults `60000` and `120`. `/health` is excluded |
+| `TRUST_PROXY` | No | Proxy hops for `X-Forwarded-For`. Unset: `1` in production, off otherwise |
 
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('docs', app, document);
+`TOKEN_SYMBOL`, `TOKEN_DECIMALS`, and `SYNC_START_BLOCK` are not configuration. Symbol and decimals come from the contract. The start block is estimated.
 
-  await app.listen(process.env.PORT ?? 3000);
-}
+## 12. Modules
 
-bootstrap();
+```text
+src/
+├── main.ts
+├── app.module.ts
+├── health/
+├── config/
+├── bootstrap/
+├── database/
+│   └── migrations/
+├── blockchain/
+│   ├── rpc-client.factory.ts
+│   ├── erc20.reader.ts
+│   ├── transfer-log.reader.ts
+│   ├── balance-rewind.service.ts
+│   └── abi/
+├── chains/
+├── tokens/
+├── balances/
+│   ├── balances.service.ts
+│   ├── holder-backfill.service.ts
+│   └── holder-sync.scheduler.ts
+├── sync/
+│   ├── sync.worker.ts
+│   ├── sync.service.ts
+│   └── checkpoint.service.ts
+└── common/utils/
 ```
 
----
+| Module | Responsibility |
+| --- | --- |
+| `blockchain` | Viem client, logs, `balanceOf`, head rewind |
+| `chains` | Chain rows and RPC endpoint sync |
+| `tokens` | Metadata and the one-token seed |
+| `sync` | Forward indexer and sync status |
+| `balances` | Balance and history API, holder catch-up |
+| `bootstrap` | Seed chain, then token, before the worker starts |
 
-## 9. Correctness guarantees
+## 13. Deferred
 
-### Event order
+- Compare `block_hash` at the checkpoint with the canonical chain and roll back from the diverging block. Until then, `confirmationDepth` is the only reorg control.
+- Store raw logs in `transfer_events` when replay or audit needs them.
+- Reconcile by the same head-rewind formula, not by `balanceOf` at an old block. That call returns 0 on HyperEVM.
+- Foreign keys from the child tables to `tokens`.
+- Top holders, admin create-token, and manual resync.
+- A queue or one worker per token. The advisory lock stays the write gate.
+- Partition `token_balance_history` by block or time once it is large. Keep the unique key compatible with the partition key.
+- Share the rewind cache if more than one process serves balance reads. Today it is in memory.
 
-Sort by `block_number` → `transaction_index` → `log_index`.
+## 14. Schema source of truth
 
-### Safe sync
+Migrations are the schema. `src/database/data-source.ts` keeps `synchronize: false` for the TypeORM CLI.
 
-- **MVP:** index only up to `head - SYNC_CONFIRMATION_DEPTH`; store `last_block_hash`.
-- **Phase 2:** if the hash at the checkpoint is no longer canonical → roll back from the diverging block → replay.
-- Write balance, history, and checkpoint in the same transaction.
-
-### Reconciliation (Phase 2)
-
-Periodically compare a sample of holders against `balanceOf(holder)` at a confirmed block. The holder list comes from events/the DB, not from `balanceOf`.
-
----
-
-## 10. Environment configuration
-
-Design env so the MVP runs immediately and scale happens by adding variables or splitting processes, without a schema change.
-
-```dotenv
-# App
-NODE_ENV=development
-PORT=3000
-
-# Process role — scale: API replicas set SYNC_ENABLED=false
-SYNC_ENABLED=true
-
-# PostgreSQL
-DATABASE_HOST=localhost
-DATABASE_PORT=5432
-DATABASE_USER=postgres
-DATABASE_PASSWORD=postgres
-DATABASE_NAME=indexer
-
-# RPC (viem)
-RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
-# Later scale (optional):
-# RPC_URL_FALLBACK=https://...
-
-# MVP token seed (1 token). Scale: insert more rows into the tokens table
-CHAIN_ID=1
-TOKEN_ADDRESS=0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48
-TOKEN_SYMBOL=USDC
-TOKEN_NAME=USD Coin
-TOKEN_DECIMALS=6
-# Use a recent block for a timely demo; production: a verified deployment/start block
-SYNC_START_BLOCK=22000000
-
-# Sync tuning — raise or lower to scale throughput
-SYNC_BLOCK_RANGE=500
-SYNC_CONFIRMATION_DEPTH=12
-SYNC_POLL_INTERVAL_MS=5000
-SYNC_RETRY_MAX_ATTEMPTS=5
-SYNC_RETRY_BASE_DELAY_MS=1000
-```
-
-| Variable | Required for MVP | Purpose |
-| --- | --- | --- |
-| `DATABASE_*` | Yes | Postgres |
-| `RPC_URL` | Yes | `eth_getLogs` / blocks |
-| `CHAIN_ID`, `TOKEN_*`, `SYNC_START_BLOCK` | Yes | Seed 1 token |
-| `SYNC_BLOCK_RANGE` | Yes | Batch size |
-| `SYNC_CONFIRMATION_DEPTH` | Yes | Reduce MVP reorg exposure |
-| `SYNC_POLL_INTERVAL_MS` | Yes | Poll once caught up to head |
-| `SYNC_ENABLED` | Recommended | Split API / worker later |
-| `SYNC_RETRY_*` | Recommended | RPC backoff |
-| `RPC_URL_FALLBACK` | No | Scale reliability |
-
-Do not commit a `.env` that contains secrets. Validate env at boot (`Joi` / `zod` / `class-validator`).
-
-**3-day demo note:** do not set `SYNC_START_BLOCK` too far behind head on mainnet (USDC from genesis will take a very long time to sync). Pick a window of a few thousand to a few tens of thousands of blocks, or use Anvil plus a local token.
-
----
-
-## 11. Testing
-
-### MVP (priority)
-
-1. Decode an ERC-20 `Transfer` correctly.
-2. Subtract from the sender and add to the receiver correctly.
-3. Mint, burn, and self-transfer.
-4. Several events for the same holder in one block.
-5. Retrying the same batch does not double-apply the balance.
-6. The DB rolls back when a batch fails partway through.
-7. The checkpoint advances only after commit.
-8. The history API returns the correct order and precision (large numbers as strings).
-
-### Phase 2+
-
-9. Reorg detection + replay.
-10. Reconciliation against `balanceOf()`.
-11. Independent checkpoints for multiple tokens.
-12. An API-only process with `SYNC_ENABLED=false`.
-
----
-
-## 12. 3-day plan and the scale path
-
-### Day 1 — Foundation
-
-- NestJS + TypeORM + Postgres (Docker Compose).
-- Migrations: `tokens`, `token_balances`, `token_balance_history`, `sync_checkpoints`.
-- Config/env validation + seed 1 token.
-- `blockchain`: RPC client + read `Transfer` logs by range.
-
-### Day 2 — Correct sync
-
-- Worker: checkpoint → fetch → decode → idempotent apply inside a transaction.
-- Handle mint/burn/self-transfer + retry backoff.
-- `confirmationDepth` safe head.
-- Keep it simple: sync a recent block window so there is demo data.
-
-### Day 3 — API and polish
-
-- Balance / history / sync-status / tokens + Swagger.
-- `GET /health`.
-- Core test cases + a README for running locally.
-- (Optional if time remains) Top holders or `transfer_events`.
-
-### Phase 2 — Reliability (after the brief)
-
-- `transfer_events` + reorg rollback/replay.
-- `balanceOf` reconciliation.
-- Structured logs / metrics / lag alerts.
-- A worker lock per token.
-
-### Phase 3 — Scale
-
-- Use `SYNC_ENABLED` to split API and worker deploys.
-- A queue by block range / a per-token worker.
-- Benchmark batch size; tune the connection pool.
-- Strict keyset pagination; partition history when it is large enough.
-- Multi-RPC fallback; multiple chains.
-
----
-
-## 13. Default architecture decisions
-
-| Item | MVP (3 days) | Scale path |
-| --- | --- | --- |
-| Backend | NestJS monolith (API + worker) | Split processes, same codebase |
-| Database | PostgreSQL | Read replica / partition later |
-| ORM | TypeORM + migrations | Unchanged |
-| Chain lib | `viem` | Provider pool |
-| Current balance | `token_balances` | + top-holders index if needed |
-| History | Event-level `token_balance_history` | Partition / retention |
-| Sync progress | `sync_checkpoints` per token | Multi-worker per token |
-| Raw events | Skip | `transfer_events` |
-| Write | Batch + TX + idempotency | Queue + lock |
-| Read | PK lookup + holder index | Cache / replica |
-| Pagination | Limit + simple cursor | Keyset |
-| Precision | `NUMERIC` + string API | Unchanged |
-| Reorg | `confirmationDepth` | Hash check + rollback |
-| Deploy | Docker Compose | API replicas + worker replicas |
-
-**Conclusion:** In 3 days, implement 1 process + 1 token + 4 core tables, but **keep the `(chain_id, token_address)` key, separated modules, idempotent writes, a per-token checkpoint, and `SYNC_ENABLED`**. That is the shortest path to a correct demo, and it still leaves room to add tokens, split the worker, and raise throughput without a redesign.
+`DatabaseModule` currently sets `synchronize: true` when `NODE_ENV=development`. That can drift the local schema away from the migration files. Turn it off so every environment, including development, changes schema only through migrations.
