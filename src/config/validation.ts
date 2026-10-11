@@ -6,6 +6,11 @@ export const envValidationSchema = Joi.object({
     .default('development'),
   PORT: Joi.number().default(3000),
   CORS_ORIGINS: Joi.string().allow('').optional(),
+  TRUST_PROXY: Joi.string()
+    .pattern(/^(true|false|\d+)$/)
+    .optional(),
+  RATE_LIMIT_TTL_MS: Joi.number().integer().min(1000).default(60_000),
+  RATE_LIMIT_MAX: Joi.number().integer().min(1).default(120),
 
   DATABASE_HOST: Joi.string().required(),
   DATABASE_PORT: Joi.number().default(5432),
