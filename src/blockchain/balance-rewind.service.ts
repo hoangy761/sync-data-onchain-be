@@ -2,7 +2,14 @@ import { Injectable, Logger } from '@nestjs/common';
 import { isAddress } from 'viem';
 import { isZeroAddress, normalizeAddress } from '../common/utils/address.util';
 import { Erc20Reader } from './erc20.reader';
-import { TransferDelta, TransferLogReader } from './transfer-log.reader';
+import {
+  HolderCursorDelta,
+  TransferDelta,
+  TransferLogReader,
+} from './transfer-log.reader';
+
+/** Holder logs and head `balanceOf` disagree, so sync must stop for this token. */
+export class ReconcileInvariantError extends Error {}
 
 /** HyperEVM `eth_getLogs` rejects a wider span. */
 const MAX_LOG_BLOCK_RANGE = 1000n;
@@ -16,28 +23,19 @@ export interface RewindBalanceParams {
   chainName?: string;
 }
 
-interface DeltaAnchor {
-  key: string;
-  /** Deltas cover every Transfer with blockNumber > afterBlock, through scannedTo. */
-  afterBlock: bigint;
-  scannedTo: bigint;
-  deltas: Map<string, bigint>;
-}
-
 /**
- * HyperEVM `balanceOf` is only reliable at the current head. Any other block
- * returns 0. Reconstruct the balance at the end of an older block as:
+ * HyperEVM `balanceOf` follows the live head. A historical block tag is not
+ * that block's balance. Reconstruct an older balance as:
  *
- *   balance(block) = balance(head) - net Transfer delta after that block
+ *   balance(cursor) = balance(head) - net Transfer delta strictly after the cursor
  *
- * One token-wide log scan is cached and resumed, so later holders and sync
- * ticks do not walk the same range again.
+ * Holder baselines use that holder's own `from` / `to` logs. A token-wide
+ * log scan can miss a transfer that `balanceOf` has already applied and then
+ * commit a balance short by exactly that transfer.
  */
 @Injectable()
 export class BalanceRewindService {
   private readonly logger = new Logger(BalanceRewindService.name);
-  private anchor: DeltaAnchor | null = null;
-  private tail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly erc20Reader: Erc20Reader,
@@ -121,11 +119,55 @@ export class BalanceRewindService {
   }
 
   async balanceAtEndOfBlock(params: RewindBalanceParams): Promise<bigint> {
+    return this.balanceAtCursor(params);
+  }
+
+  /**
+   * Balance just after `blockNumber`, including `logIndex` when it is set.
+   * Omitting `logIndex` means the end of that block.
+   */
+  async balanceAtCursor(
+    params: RewindBalanceParams & { logIndex?: number | null },
+  ): Promise<bigint> {
     this.assertAddresses(params.tokenAddress, params.holderAddress);
     const holder = normalizeAddress(params.holderAddress);
+    const cursorLog = params.logIndex ?? null;
 
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      const head = await this.catchUp(params, params.blockNumber);
+    if (isZeroAddress(holder)) {
+      return 0n;
+    }
+
+    const logs: HolderCursorDelta[] = [];
+    let nextBlock =
+      cursorLog == null ? params.blockNumber + 1n : params.blockNumber;
+
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      const head = await this.transferLogReader.getLatestBlockNumber(
+        params.chainId,
+        params.rpcUrl,
+        params.chainName,
+      );
+      if (head < params.blockNumber) {
+        throw new Error(
+          `Head ${head} is behind balance cursor block ${params.blockNumber} for ${holder}`,
+        );
+      }
+
+      if (nextBlock <= head) {
+        logs.push(
+          ...(await this.transferLogReader.getHolderTransferDeltas(
+            params.chainId,
+            params.rpcUrl,
+            params.tokenAddress,
+            holder,
+            nextBlock,
+            head,
+            params.chainName,
+          )),
+        );
+        nextBlock = head + 1n;
+      }
+
       const balance = await this.erc20Reader.balanceOf(
         params.chainId,
         params.rpcUrl,
@@ -141,96 +183,60 @@ export class BalanceRewindService {
       );
       if (head !== headAfter) {
         this.logger.debug(
-          `Head moved ${head} -> ${headAfter} while reading balanceOf for ${holder}; retry ${attempt}/5`,
+          `Head moved ${head} -> ${headAfter} while reconciling ${holder}; scanning the new tip`,
         );
         continue;
       }
 
-      const delta = this.anchor?.deltas.get(holder) ?? 0n;
+      const delta = this.netDeltaAfterCursor(
+        holder,
+        logs,
+        params.blockNumber,
+        cursorLog,
+      );
       const rewound = balance - delta;
       if (rewound < 0n) {
-        throw new Error(
-          `Rewound balance for ${holder} is negative (${rewound}) at end of block ${params.blockNumber}`,
+        throw new ReconcileInvariantError(
+          `Reconciled balance for ${holder} is negative (${rewound}) at block ${params.blockNumber}`,
         );
       }
 
       this.logger.log(
-        `Rewound ${holder} = ${rewound} at end of block ${params.blockNumber} (head ${head} balance ${balance}, later delta ${delta})`,
+        `Reconciled ${holder} = ${rewound} at block ${params.blockNumber}${
+          cursorLog == null ? '' : ` log ${cursorLog}`
+        } (head ${head} balance ${balance}, later delta ${delta})`,
       );
       return rewound;
     }
 
-    throw new Error(`Head kept moving while reading balanceOf for ${holder}`);
+    throw new Error(`Head kept moving while reconciling balance for ${holder}`);
   }
 
-  private async catchUp(
-    params: RewindBalanceParams,
-    afterBlock: bigint,
-  ): Promise<bigint> {
-    return this.runExclusive(async () => {
-      this.prepareAnchor(params, afterBlock);
-      const head = await this.transferLogReader.getLatestBlockNumber(
-        params.chainId,
-        params.rpcUrl,
-        params.chainName,
-      );
-      await this.extendScan(params, head);
-      return this.anchor!.scannedTo < head ? head : this.anchor!.scannedTo;
-    });
-  }
-
-  private prepareAnchor(params: RewindBalanceParams, afterBlock: bigint): void {
-    const key = `${params.chainId}:${normalizeAddress(params.tokenAddress)}`;
-    if (
-      this.anchor &&
-      this.anchor.key === key &&
-      this.anchor.afterBlock <= afterBlock
-    ) {
-      // A newer checkpoint reuses this anchor. Holders with no balance row have
-      // no Transfer between afterBlock and that checkpoint, so the gap adds 0.
-      return;
-    }
-
-    this.anchor = {
-      key,
-      afterBlock,
-      scannedTo: afterBlock,
-      deltas: new Map(),
-    };
-  }
-
-  private async extendScan(
-    params: RewindBalanceParams,
-    toBlock: bigint,
-  ): Promise<void> {
-    const anchor = this.anchor!;
-    let start = anchor.scannedTo + 1n;
-    if (start > toBlock) {
-      return;
-    }
-
-    const span = toBlock - start + 1n;
-    this.logger.log(
-      `Rewind scan ${start}..${toBlock} (${span} blocks) for balances after block ${anchor.afterBlock}`,
-    );
-
-    let chunks = 0;
-    while (start <= toBlock) {
-      const end =
-        start + MAX_LOG_BLOCK_RANGE - 1n > toBlock
-          ? toBlock
-          : start + MAX_LOG_BLOCK_RANGE - 1n;
-      const logs = await this.fetchDeltasWithRetry(params, start, end);
-      for (const log of logs) {
-        this.applyDelta(anchor, log);
+  private netDeltaAfterCursor(
+    holder: string,
+    logs: HolderCursorDelta[],
+    cursorBlock: bigint,
+    cursorLog: number | null,
+  ): bigint {
+    let delta = 0n;
+    for (const transfer of logs) {
+      const after =
+        cursorLog == null
+          ? transfer.blockNumber > cursorBlock
+          : transfer.blockNumber > cursorBlock ||
+            (transfer.blockNumber === cursorBlock &&
+              transfer.logIndex > cursorLog);
+      if (!after) {
+        continue;
       }
-      anchor.scannedTo = end;
-      chunks += 1;
-      if (chunks % 20 === 0) {
-        this.logger.log(`Rewind scan reached block ${anchor.scannedTo} / ${toBlock}`);
+      if (transfer.from === holder && !isZeroAddress(transfer.from)) {
+        delta -= transfer.value;
       }
-      start = end + 1n;
+      if (transfer.to === holder && !isZeroAddress(transfer.to)) {
+        delta += transfer.value;
+      }
     }
+    return delta;
   }
 
   private async listDeltas(
@@ -268,17 +274,6 @@ export class BalanceRewindService {
       }
     }
     return delta;
-  }
-
-  private applyDelta(anchor: DeltaAnchor, transfer: TransferDelta): void {
-    const from = transfer.from;
-    const to = transfer.to;
-    if (!isZeroAddress(from)) {
-      anchor.deltas.set(from, (anchor.deltas.get(from) ?? 0n) - transfer.value);
-    }
-    if (!isZeroAddress(to)) {
-      anchor.deltas.set(to, (anchor.deltas.get(to) ?? 0n) + transfer.value);
-    }
   }
 
   private async fetchDeltasWithRetry(
@@ -323,15 +318,6 @@ export class BalanceRewindService {
       message.includes('econnreset') ||
       message.includes('etimedout')
     );
-  }
-
-  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.tail.then(fn, fn);
-    this.tail = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
   }
 
   private assertAddresses(tokenAddress: string, holderAddress: string): void {

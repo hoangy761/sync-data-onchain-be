@@ -2,7 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, Repository } from 'typeorm';
-import { BalanceRewindService } from '../blockchain/balance-rewind.service';
+import {
+  BalanceRewindService,
+  ReconcileInvariantError,
+} from '../blockchain/balance-rewind.service';
 import {
   DecodedTransfer,
   TransferLogReader,
@@ -40,9 +43,29 @@ export function syncPercent(
   return `${whole}.${fraction}`;
 }
 
+/** The in-flight range would drive a holder below zero. The database transaction rolls back. */
+export class NegativeBalanceError extends Error {
+  constructor(
+    readonly holder: string,
+    readonly txHash: string,
+    readonly logIndex: number,
+    readonly before: bigint,
+  ) {
+    super(
+      `Negative balance for ${holder} at ${txHash}:${logIndex} from stored balance ${before}`,
+    );
+  }
+}
+
+/** Stored history cannot be reconciled with head balanceOf. Sync stops for this token. */
+export class BalanceInvariantError extends Error {}
+
+const MAX_BALANCE_REPAIRS = 50;
+
 @Injectable()
 export class SyncService {
   private readonly logger = new Logger(SyncService.name);
+  private readonly haltedTokens = new Set<string>();
 
   constructor(
     private readonly tokensService: TokensService,
@@ -63,7 +86,25 @@ export class SyncService {
   async syncOnce(): Promise<void> {
     const tokens = await this.tokensService.findEnabled();
     for (const token of tokens) {
-      await this.syncTokenRange(token);
+      const key = `${token.chainId}:${token.tokenAddress}`;
+      if (this.haltedTokens.has(key)) {
+        continue;
+      }
+      try {
+        await this.syncTokenRange(token);
+      } catch (err) {
+        if (
+          err instanceof BalanceInvariantError ||
+          err instanceof ReconcileInvariantError
+        ) {
+          this.haltedTokens.add(key);
+          this.logger.error(
+            `Sync halted for ${token.symbol} (${token.tokenAddress}): ${err.message}`,
+          );
+          continue;
+        }
+        throw err;
+      }
     }
   }
 
@@ -183,16 +224,37 @@ export class SyncService {
         fromBlock - 1n,
       );
 
-      await this.dataSource.transaction(async (manager) => {
-        await lockTokenWrites(manager, token.chainId, token.tokenAddress);
-        await this.applyTransfers(manager, token, transfers, baselines);
-        await manager.getRepository(SyncCheckpoint).save({
-          chainId: token.chainId,
-          tokenAddress: token.tokenAddress,
-          lastProcessedBlock: toBlock.toString(),
-          lastBlockHash: endBlock.hash,
-        });
-      });
+      for (let repair = 0; ; repair++) {
+        try {
+          await this.dataSource.transaction(async (manager) => {
+            await lockTokenWrites(manager, token.chainId, token.tokenAddress);
+            await this.applyTransfers(manager, token, transfers, baselines);
+            await manager.getRepository(SyncCheckpoint).save({
+              chainId: token.chainId,
+              tokenAddress: token.tokenAddress,
+              lastProcessedBlock: toBlock.toString(),
+              lastBlockHash: endBlock.hash,
+            });
+          });
+          break;
+        } catch (err) {
+          if (!(err instanceof NegativeBalanceError)) {
+            throw err;
+          }
+          if (repair >= MAX_BALANCE_REPAIRS) {
+            throw new BalanceInvariantError(
+              `Sync halted after ${MAX_BALANCE_REPAIRS} balance repairs; last error: ${err.message}`,
+            );
+          }
+          this.logger.warn(`Repairing stored balance after ${err.message}`);
+          await this.repairCommittedBalance(
+            token,
+            chain.rpcUrl,
+            chain.name,
+            err.holder,
+          );
+        }
+      }
 
       this.logger.log(
         `Synced ${token.symbol}: ${transfers.length} transfer(s), checkpoint=${toBlock}`,
@@ -202,8 +264,9 @@ export class SyncService {
 
   /**
    * Holders with no balance row yet cannot use historical balanceOf on HyperEVM.
-   * Seed them from the live head balance minus every Transfer after `targetBlock`
-   * (the checkpoint). That equals the balance just before their first indexed transfer.
+   * Seed them from the live head balance minus this holder's own Transfers after
+   * `targetBlock` (the checkpoint). That is the balance just before their first
+   * indexed transfer.
    */
   private async baselineNewHolders(
     token: Token,
@@ -259,7 +322,7 @@ export class SyncService {
       });
       baselines.set(holder, before);
       this.logger.log(
-        `Baseline ${holder} = ${before} rewound from head to end of block ${targetBlock}`,
+        `Baseline ${holder} = ${before} reconciled from holder logs at end of block ${targetBlock}`,
       );
     }
 
@@ -335,8 +398,11 @@ export class SyncService {
 
         const after = before + delta;
         if (after < 0n) {
-          throw new Error(
-            `Negative balance for ${holder} at ${txHash}:${transfer.logIndex} after rewound baseline ${before}`,
+          throw new NegativeBalanceError(
+            holder,
+            txHash,
+            transfer.logIndex,
+            before,
           );
         }
 
@@ -394,6 +460,154 @@ export class SyncService {
     return updates;
   }
 
+  /**
+   * The committed balance is short of the head rewind. Shift every stored
+   * balance for this holder by that constant, then let the range apply again.
+   * Deltas stay as indexed. A repair that cannot explain the debit aborts sync.
+   */
+  private async repairCommittedBalance(
+    token: Token,
+    rpcUrl: string,
+    chainName: string,
+    holder: string,
+  ): Promise<void> {
+    const row = await this.balancesRepo.findOne({
+      where: {
+        chainId: token.chainId,
+        tokenAddress: token.tokenAddress,
+        holderAddress: holder,
+      },
+    });
+    if (!row) {
+      throw new BalanceInvariantError(
+        `No committed balance to repair for ${holder}. Holder-log baseline still cannot cover the next transfer`,
+      );
+    }
+
+    const stored = BigInt(row.balance);
+    const cursorBlock = BigInt(row.updatedBlock);
+    const cursorLog = row.updatedLogIndex;
+    const corrected = await this.balanceRewind.balanceAtCursor({
+      chainId: token.chainId,
+      rpcUrl,
+      tokenAddress: token.tokenAddress,
+      holderAddress: holder,
+      blockNumber: cursorBlock,
+      logIndex: cursorLog,
+      chainName,
+    });
+    const shortfall = corrected - stored;
+    if (shortfall === 0n) {
+      throw new BalanceInvariantError(
+        `Stored balance for ${holder} already matches the head rewind (${stored}) at block ${cursorBlock}, but a later transfer still goes negative`,
+      );
+    }
+
+    await this.dataSource.transaction(async (manager) => {
+      await lockTokenWrites(manager, token.chainId, token.tokenAddress);
+      const current = await manager.getRepository(TokenBalance).findOne({
+        where: {
+          chainId: token.chainId,
+          tokenAddress: token.tokenAddress,
+          holderAddress: holder,
+        },
+      });
+      if (
+        !current ||
+        current.updatedBlock !== row.updatedBlock ||
+        current.updatedLogIndex !== row.updatedLogIndex ||
+        BigInt(current.balance) !== stored
+      ) {
+        throw new Error(
+          `Balance cursor for ${holder} changed while repairing; retry`,
+        );
+      }
+
+      const historyRepo = manager.getRepository(TokenBalanceHistory);
+      const latest = await historyRepo.findOne({
+        where: {
+          chainId: token.chainId,
+          tokenAddress: token.tokenAddress,
+          holderAddress: holder,
+        },
+        order: {
+          blockNumber: 'DESC',
+          transactionIndex: 'DESC',
+          logIndex: 'DESC',
+        },
+      });
+      if (latest && BigInt(latest.balanceAfter) !== stored) {
+        throw new BalanceInvariantError(
+          `History for ${holder} ends at ${latest.balanceAfter}, stored balance is ${stored}`,
+        );
+      }
+      if (
+        latest &&
+        this.historyAfterCursor(latest, cursorBlock, cursorLog)
+      ) {
+        throw new BalanceInvariantError(
+          `History for ${holder} extends past balance cursor ${cursorBlock}:${cursorLog ?? 'end'}`,
+        );
+      }
+
+      const negative = await manager.query(
+        `SELECT COUNT(*)::int AS n
+         FROM token_balance_history
+         WHERE chain_id = $1
+           AND token_address = $2
+           AND holder_address = $3
+           AND (
+             balance_before + $4::numeric < 0
+             OR balance_after + $4::numeric < 0
+           )`,
+        [token.chainId, token.tokenAddress, holder, shortfall.toString()],
+      );
+      const negativeCount = Number(negative?.[0]?.n ?? 0);
+      if (negativeCount > 0) {
+        throw new BalanceInvariantError(
+          `Repairing ${holder} by ${shortfall} would make a stored balance negative`,
+        );
+      }
+
+      await manager.query(
+        `UPDATE token_balance_history
+         SET balance_before = balance_before + $4::numeric,
+             balance_after = balance_after + $4::numeric
+         WHERE chain_id = $1
+           AND token_address = $2
+           AND holder_address = $3`,
+        [token.chainId, token.tokenAddress, holder, shortfall.toString()],
+      );
+      await manager.getRepository(TokenBalance).update(
+        {
+          chainId: token.chainId,
+          tokenAddress: token.tokenAddress,
+          holderAddress: holder,
+        },
+        { balance: corrected.toString() },
+      );
+    });
+
+    this.logger.warn(
+      `Repaired ${holder} balance ${stored} -> ${corrected} (shortfall ${shortfall}) at block ${cursorBlock}`,
+    );
+  }
+
+  private historyAfterCursor(
+    row: { blockNumber: string; logIndex: number },
+    cursorBlock: bigint,
+    cursorLog: number | null,
+  ): boolean {
+    const block = BigInt(row.blockNumber);
+    if (block > cursorBlock) {
+      return true;
+    }
+    if (block < cursorBlock || cursorLog == null) {
+      return false;
+    }
+    return row.logIndex > cursorLog;
+  }
+
   private async withRetry(
     fn: () => Promise<void>,
     maxAttempts: number,
@@ -407,7 +621,11 @@ export class SyncService {
         await fn();
         return;
       } catch (err) {
-        if (attempt >= maxAttempts) {
+        if (
+          err instanceof BalanceInvariantError ||
+          err instanceof ReconcileInvariantError ||
+          attempt >= maxAttempts
+        ) {
           throw err;
         }
         const delay = baseDelayMs * 2 ** (attempt - 1);

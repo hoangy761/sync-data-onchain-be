@@ -33,6 +33,15 @@ export interface TransferDelta {
   value: bigint;
 }
 
+/** One holder's transfer, ordered by block and log so a cursor can exclude it. */
+export interface HolderCursorDelta {
+  blockNumber: bigint;
+  logIndex: number;
+  from: string;
+  to: string;
+  value: bigint;
+}
+
 /** HyperEVM `eth_getLogs` rejects a wider span. */
 const MAX_LOG_BLOCK_RANGE = 1000n;
 
@@ -320,6 +329,80 @@ export class TransferLogReader {
       return a.logIndex - b.logIndex;
     });
     return decoded;
+  }
+
+  /**
+   * Holder `from` / `to` transfers in an inclusive range, without block timestamps.
+   * Self-transfers are returned once. Chunked to the RPC range limit.
+   */
+  async getHolderTransferDeltas(
+    chainId: number,
+    rpcUrl: string,
+    tokenAddress: string,
+    holderAddress: string,
+    fromBlock: bigint,
+    toBlock: bigint,
+    chainName?: string,
+  ): Promise<HolderCursorDelta[]> {
+    if (fromBlock > toBlock) {
+      return [];
+    }
+
+    const holder = getAddress(holderAddress) as Address;
+    const byEvent = new Map<string, HolderCursorDelta>();
+    let start = fromBlock;
+    let chunks = 0;
+
+    while (start <= toBlock) {
+      const end =
+        start + MAX_LOG_BLOCK_RANGE - 1n > toBlock
+          ? toBlock
+          : start + MAX_LOG_BLOCK_RANGE - 1n;
+      const outgoing = await this.withLogRetry(
+        `holder delta from ${start}..${end}`,
+        () =>
+          this.fetchDecodedLogs(
+            chainId,
+            rpcUrl,
+            tokenAddress,
+            start,
+            end,
+            { from: holder },
+            chainName,
+          ),
+      );
+      const incoming = await this.withLogRetry(
+        `holder delta to ${start}..${end}`,
+        () =>
+          this.fetchDecodedLogs(
+            chainId,
+            rpcUrl,
+            tokenAddress,
+            start,
+            end,
+            { to: holder },
+            chainName,
+          ),
+      );
+      for (const log of [...outgoing, ...incoming]) {
+        byEvent.set(`${log.txHash.toLowerCase()}:${log.logIndex}`, {
+          blockNumber: log.blockNumber,
+          logIndex: log.logIndex,
+          from: log.from,
+          to: log.to,
+          value: log.value,
+        });
+      }
+      chunks += 1;
+      if (chunks % 25 === 0) {
+        this.logger.log(
+          `Holder ${holderAddress} delta scan reached block ${end} / ${toBlock}`,
+        );
+      }
+      start = end + 1n;
+    }
+
+    return [...byEvent.values()];
   }
 
   /**
